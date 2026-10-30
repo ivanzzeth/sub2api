@@ -209,6 +209,7 @@ type IdempotencyConfig struct {
 
 type BatchImageConfig struct {
 	Enabled                           bool   `mapstructure:"enabled"`
+	GeminiBaseURL                     string `mapstructure:"gemini_base_url"`
 	MaxItemsPerJobDefault             int    `mapstructure:"max_items_per_job_default"`
 	MaxItemsPerJobTrial               int    `mapstructure:"max_items_per_job_trial"`
 	MaxOutputImagesPerJob             int    `mapstructure:"max_output_images_per_job"`
@@ -2244,6 +2245,7 @@ func setDefaults() {
 
 	// Batch Image queue
 	viper.SetDefault("batch_image.enabled", false)
+	viper.SetDefault("batch_image.gemini_base_url", "")
 	viper.SetDefault("batch_image.max_items_per_job_default", 200)
 	viper.SetDefault("batch_image.max_items_per_job_trial", 50)
 	viper.SetDefault("batch_image.max_output_images_per_job", 200)

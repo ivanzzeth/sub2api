@@ -46,6 +46,16 @@ func (s *dailyUsageRepoStub) GetUsageTrendWithFilters(
 	return s.trend, nil
 }
 
+func (s *dailyUsageRepoStub) GetAPIKeyDailyUsageInLocation(ctx context.Context, userID, apiKeyID int64, startTime, endTime time.Time) ([]usagestats.TrendDataPoint, error) {
+	s.called = true
+	s.startTime = startTime
+	s.endTime = endTime
+	s.granularity = "day"
+	s.userID = userID
+	s.apiKeyID = apiKeyID
+	return s.trend, nil
+}
+
 type dailyUsageAPIKeyRepoStub struct {
 	service.APIKeyRepository
 	keys map[int64]*service.APIKey

@@ -578,13 +578,14 @@ func (c *GeminiBatchHTTPClient) DownloadFile(ctx context.Context, apiKey string,
 	if downloadURL == "" {
 		downloadURL = strings.TrimSpace(metadata.DownloadURL)
 	}
+	providedDownloadURL := downloadURL != ""
 	if downloadURL == "" {
 		downloadURL = c.baseURL + "/v1beta/" + strings.TrimLeft(fileName, "/") + ":download"
 	}
-	// 纵深加固：downloadUri 来自上游响应，跟随前校验目标 host，
-	// 防止异常/被劫持的响应把带 api key 的请求带到任意主机。
-	if err := validateGeminiDownloadHost(downloadURL, c.baseURL); err != nil {
-		return nil, "", err
+	if providedDownloadURL {
+		if err := validateGeminiDownloadHost(downloadURL, c.baseURL); err != nil {
+			return nil, "", err
+		}
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, downloadURL, nil)
 	if err != nil {

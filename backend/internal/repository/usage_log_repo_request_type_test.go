@@ -484,6 +484,27 @@ func TestUsageLogRepositoryGetUsageTrendWithFiltersRequestTypePriority(t *testin
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
+func TestAPIKeyDailyUsageBucketsInRequestedLocation(t *testing.T) {
+	for _, zone := range []string{"Pacific/Kiritimati", "Pacific/Honolulu"} {
+		t.Run(zone, func(t *testing.T) {
+			db, mock := newSQLMock(t)
+			repo := &usageLogRepository{sql: db}
+			location, err := time.LoadLocation(zone)
+			require.NoError(t, err)
+			start := time.Date(2025, 1, 1, 0, 0, 0, 0, location)
+			end := start.AddDate(0, 0, 1)
+			mock.ExpectQuery("TO_CHAR\\(created_at AT TIME ZONE \\$3, 'YYYY-MM-DD'\\)").
+				WithArgs(start, end, zone, int64(42), int64(7)).
+				WillReturnRows(sqlmock.NewRows([]string{"date", "requests", "input_tokens", "output_tokens", "cache_creation_tokens", "cache_read_tokens", "total_tokens", "cost", "actual_cost"}).AddRow("2025-01-01", 1, 10, 20, 0, 0, 30, 0.2, 0.2))
+			points, err := repo.GetAPIKeyDailyUsageInLocation(context.Background(), 42, 7, start, end)
+			require.NoError(t, err)
+			require.Len(t, points, 1)
+			require.Equal(t, "2025-01-01", points[0].Date)
+			require.NoError(t, mock.ExpectationsWereMet())
+		})
+	}
+}
+
 func TestUsageLogRepositoryGetUsageTrendWithUsageFiltersRequestedModelSource(t *testing.T) {
 	db, mock := newSQLMock(t)
 	repo := &usageLogRepository{sql: db}

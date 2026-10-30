@@ -3,6 +3,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -37,6 +38,10 @@ func TestAuthHandlerRevokeAllSessionsInvalidatesAccessTokens(t *testing.T) {
 	}
 	authService := service.NewAuthService(nil, repo, nil, refreshTokenCache, cfg, nil, nil, nil, nil, nil, nil, nil, nil)
 	handler := &AuthHandler{authService: authService}
+	firstToken, err := authService.GenerateToken(context.Background(), repo.user)
+	require.NoError(t, err)
+	firstClaims, err := authService.ValidateToken(firstToken)
+	require.NoError(t, err)
 
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)
@@ -47,10 +52,13 @@ func TestAuthHandlerRevokeAllSessionsInvalidatesAccessTokens(t *testing.T) {
 
 	require.Equal(t, http.StatusOK, recorder.Code)
 	require.Equal(t, []int64{29}, refreshTokenCache.revokedUserIDs)
-	// users 表没有 token_version 列（见 resolvedTokenVersion：JWT 里的值由
-	// email+password_hash 指纹推导），所以自增 TokenVersion 只停留在内存里。
-	// 此前紧跟其后的整行 Update 不写任何有效数据，却会用旧快照覆盖并发写入的列，
-	// 已移除。会话撤销由上面的 refresh session 清理承担。
+	require.NotEmpty(t, refreshTokenCache.marker)
+	require.ErrorIs(t, authService.CheckAccessTokenRevocation(context.Background(), firstClaims), service.ErrTokenRevoked)
+	freshToken, err := authService.GenerateToken(context.Background(), repo.user)
+	require.NoError(t, err)
+	freshClaims, err := authService.ValidateToken(freshToken)
+	require.NoError(t, err)
+	require.NoError(t, authService.CheckAccessTokenRevocation(context.Background(), freshClaims))
 	require.Equal(t, int64(7), repo.user.TokenVersion)
 
 	var resp struct {

@@ -8,12 +8,68 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
+	"github.com/Wei-Shaw/sub2api/internal/config"
 	infraerrors "github.com/Wei-Shaw/sub2api/internal/pkg/errors"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/geminicli"
 	"github.com/stretchr/testify/require"
 )
+
+func TestGeminiBatchRegistry_ConfiguredMockURL(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		require.Equal(t, http.MethodGet, request.Method)
+		require.Equal(t, "/v1beta/batches/test", request.URL.Path)
+		require.Equal(t, "test-key", request.Header.Get("x-goog-api-key"))
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(writer, `{"name":"batches/test","state":"JOB_STATE_PENDING"}`)
+	}))
+	defer server.Close()
+
+	registry := NewBatchImageProviderRegistryFromConfig(&config.Config{BatchImage: config.BatchImageConfig{GeminiBaseURL: server.URL}})
+	provider, ok := registry.Get(BatchImageProviderGeminiAPI)
+	require.True(t, ok)
+	client, ok := provider.(*GeminiAPIBatchImageProvider).client.(*GeminiBatchHTTPClient)
+	require.True(t, ok)
+	job, err := client.GetBatch(context.Background(), "test-key", "batches/test")
+	require.NoError(t, err)
+	require.Equal(t, "batches/test", job.Name)
+
+	for _, cfg := range []*config.Config{nil, {}, {BatchImage: config.BatchImageConfig{GeminiBaseURL: "  "}}} {
+		defaultProvider, found := NewBatchImageProviderRegistryFromConfig(cfg).Get(BatchImageProviderGeminiAPI)
+		require.True(t, found)
+		defaultClient, valid := defaultProvider.(*GeminiAPIBatchImageProvider).client.(*GeminiBatchHTTPClient)
+		require.True(t, valid)
+		require.Equal(t, geminicli.AIStudioBaseURL, defaultClient.baseURL)
+	}
+}
+
+func TestGeminiBatchHTTPClient_LocalFallbackDownloadDoesNotFollowUpstreamURL(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		require.Equal(t, "test-key", request.Header.Get("x-goog-api-key"))
+		switch request.URL.Path {
+		case "/v1beta/files/result":
+			_, _ = io.WriteString(writer, `{"mimeType":"application/jsonl"}`)
+		case "/v1beta/files/result:download":
+			_, _ = io.WriteString(writer, "local result")
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+
+	client := NewGeminiBatchHTTPClient(server.URL, nil)
+	result, _, err := client.DownloadFile(context.Background(), "test-key", "files/result")
+	require.NoError(t, err)
+	defer result.Close()
+	content, err := io.ReadAll(result)
+	require.NoError(t, err)
+	require.Equal(t, "local result", string(content))
+	require.Error(t, validateGeminiDownloadHost("http://different.invalid/stolen", server.URL))
+}
 
 func TestBatchImageProviderRegistry_ReturnsGeminiAPI(t *testing.T) {
 	registry := NewDefaultBatchImageProviderRegistry()

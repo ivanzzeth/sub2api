@@ -1423,6 +1423,37 @@ func (s *UsageLogRepoSuite) TestGetUsageTrendWithFilters() {
 	s.Require().Len(trend, 2)
 }
 
+func (s *UsageLogRepoSuite) TestAPIKeyDailyUsageInLocationCrossesMidnight() {
+	user := mustCreateUser(s.T(), s.client, &service.User{Email: "daily-local@test.com"})
+	apiKey := mustCreateApiKey(s.T(), s.client, &service.APIKey{UserID: user.ID, Key: "sk-daily-local", Name: "k"})
+	otherKey := mustCreateApiKey(s.T(), s.client, &service.APIKey{UserID: user.ID, Key: "sk-daily-other", Name: "other"})
+	account := mustCreateAccount(s.T(), s.client, &service.Account{Name: "acc-daily-local"})
+	instant := time.Date(2025, 1, 1, 12, 30, 0, 0, time.UTC)
+	s.createUsageLog(user, apiKey, account, 10, 20, 0.2, instant)
+	s.createUsageLog(user, otherKey, account, 10, 20, 0.2, instant)
+
+	for _, testcase := range []struct {
+		zone string
+		date string
+	}{
+		{zone: "Pacific/Kiritimati", date: "2025-01-02"},
+		{zone: "Pacific/Honolulu", date: "2025-01-01"},
+	} {
+		s.Run(testcase.zone, func() {
+			location, err := time.LoadLocation(testcase.zone)
+			s.Require().NoError(err)
+			start := time.Date(2025, 1, 1, 0, 0, 0, 0, location)
+			end := start.AddDate(0, 0, 3)
+			points, err := s.repo.GetAPIKeyDailyUsageInLocation(s.ctx, user.ID, apiKey.ID, start, end)
+			s.Require().NoError(err)
+			s.Require().Len(points, 1)
+			s.Require().Equal(testcase.date, points[0].Date)
+			s.Require().Equal(int64(1), points[0].Requests)
+			s.Require().InDelta(0.2, points[0].ActualCost, 0.001)
+		})
+	}
+}
+
 func (s *UsageLogRepoSuite) TestGetUsageTrendWithFilters_HourlyGranularity() {
 	user := mustCreateUser(s.T(), s.client, &service.User{Email: "trendfilters-h@test.com"})
 	apiKey := mustCreateApiKey(s.T(), s.client, &service.APIKey{UserID: user.ID, Key: "sk-trendfilters-h", Name: "k"})

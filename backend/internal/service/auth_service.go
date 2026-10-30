@@ -58,10 +58,11 @@ const refreshTokenPrefix = "rt_"
 
 // JWTClaims JWT载荷数据
 type JWTClaims struct {
-	UserID       int64  `json:"user_id"`
-	Email        string `json:"email"`
-	Role         string `json:"role"`
-	TokenVersion int64  `json:"token_version"` // Used to invalidate tokens on password change
+	UserID           int64  `json:"user_id"`
+	Email            string `json:"email"`
+	Role             string `json:"role"`
+	TokenVersion     int64  `json:"token_version"` // Used to invalidate tokens on password change
+	RevocationMarker string `json:"rv,omitempty"`
 	// SessionID 会话 ID（与 refresh token family 对应），用于单会话撤销与 step-up 授权绑定。
 	SessionID string `json:"sid,omitempty"`
 	// BindingHash 会话指纹哈希（IP+UA），会话绑定开启时校验；空值表示旧 token（平滑升级）。
@@ -1413,11 +1414,15 @@ func (s *AuthService) GenerateToken(ctx context.Context, user *User) (string, er
 	if err != nil {
 		return "", fmt.Errorf("generate session id: %w", err)
 	}
-	return s.generateAccessToken(user, sessionID, sessionBindingHashFromContext(ctx))
+	return s.generateAccessToken(ctx, user, sessionID, sessionBindingHashFromContext(ctx))
 }
 
 // generateAccessToken 生成带会话 ID 与绑定指纹的 access token。
-func (s *AuthService) generateAccessToken(user *User, sessionID, bindingHash string) (string, error) {
+func (s *AuthService) generateAccessToken(ctx context.Context, user *User, sessionID, bindingHash string) (string, error) {
+	marker, err := s.accessTokenRevocationMarker(ctx, user.ID)
+	if err != nil {
+		return "", err
+	}
 	now := time.Now()
 	var expiresAt time.Time
 	if s.cfg.JWT.AccessTokenExpireMinutes > 0 {
@@ -1428,12 +1433,13 @@ func (s *AuthService) generateAccessToken(user *User, sessionID, bindingHash str
 	}
 
 	claims := &JWTClaims{
-		UserID:       user.ID,
-		Email:        user.Email,
-		Role:         user.Role,
-		TokenVersion: resolvedTokenVersion(user),
-		SessionID:    sessionID,
-		BindingHash:  bindingHash,
+		UserID:           user.ID,
+		Email:            user.Email,
+		Role:             user.Role,
+		TokenVersion:     resolvedTokenVersion(user),
+		RevocationMarker: marker,
+		SessionID:        sessionID,
+		BindingHash:      bindingHash,
 		RegisteredClaims: jwt.RegisteredClaims{
 			ExpiresAt: jwt.NewNumericDate(expiresAt),
 			IssuedAt:  jwt.NewNumericDate(now),
@@ -1703,7 +1709,7 @@ func (s *AuthService) GenerateTokenPair(ctx context.Context, user *User, familyI
 	}
 
 	// 生成Access Token（携带会话ID与绑定指纹）
-	accessToken, err := s.generateAccessToken(user, familyID, sessionBindingHashFromContext(ctx))
+	accessToken, err := s.generateAccessToken(ctx, user, familyID, sessionBindingHashFromContext(ctx))
 	if err != nil {
 		return nil, fmt.Errorf("generate access token: %w", err)
 	}
@@ -1712,6 +1718,16 @@ func (s *AuthService) GenerateTokenPair(ctx context.Context, user *User, familyI
 	refreshToken, err := s.generateRefreshToken(ctx, user, familyID)
 	if err != nil {
 		return nil, fmt.Errorf("generate refresh token: %w", err)
+	}
+	claims, err := s.ValidateToken(accessToken)
+	if err != nil {
+		_ = s.RevokeRefreshToken(ctx, refreshToken)
+		return nil, err
+	}
+	marker, err := s.accessTokenRevocationMarker(ctx, user.ID)
+	if err != nil || claims.RevocationMarker != marker {
+		_ = s.RevokeRefreshToken(ctx, refreshToken)
+		return nil, ErrTokenRevoked
 	}
 
 	return &TokenPair{
@@ -1723,6 +1739,10 @@ func (s *AuthService) GenerateTokenPair(ctx context.Context, user *User, familyI
 
 // generateRefreshToken 生成并存储Refresh Token
 func (s *AuthService) generateRefreshToken(ctx context.Context, user *User, familyID string) (string, error) {
+	marker, err := s.accessTokenRevocationMarker(ctx, user.ID)
+	if err != nil {
+		return "", err
+	}
 	// 生成随机Token
 	tokenBytes := make([]byte, 32)
 	if _, err := rand.Read(tokenBytes); err != nil {
@@ -1746,12 +1766,13 @@ func (s *AuthService) generateRefreshToken(ctx context.Context, user *User, fami
 	ttl := time.Duration(s.cfg.JWT.RefreshTokenExpireDays) * 24 * time.Hour
 
 	data := &RefreshTokenData{
-		UserID:       user.ID,
-		TokenVersion: resolvedTokenVersion(user),
-		FamilyID:     familyID,
-		BindingHash:  sessionBindingHashFromContext(ctx),
-		CreatedAt:    now,
-		ExpiresAt:    now.Add(ttl),
+		UserID:           user.ID,
+		TokenVersion:     resolvedTokenVersion(user),
+		RevocationMarker: marker,
+		FamilyID:         familyID,
+		BindingHash:      sessionBindingHashFromContext(ctx),
+		CreatedAt:        now,
+		ExpiresAt:        now.Add(ttl),
 	}
 
 	// 存储Token数据
@@ -1833,6 +1854,13 @@ func (s *AuthService) RefreshTokenPair(ctx context.Context, refreshToken string)
 		_ = s.refreshTokenCache.DeleteTokenFamily(ctx, data.FamilyID)
 		return nil, ErrTokenRevoked
 	}
+	marker, err := s.accessTokenRevocationMarker(ctx, user.ID)
+	if err != nil {
+		return nil, ErrServiceUnavailable
+	}
+	if marker != data.RevocationMarker {
+		return nil, ErrTokenRevoked
+	}
 
 	// 会话绑定检查：IP/UA 任一变化即撤销整个会话家族。
 	// data.BindingHash 为空表示功能开启前签发的旧会话，放行并在轮转时补齐绑定。
@@ -1854,6 +1882,11 @@ func (s *AuthService) RefreshTokenPair(ctx context.Context, refreshToken string)
 	pair, err := s.GenerateTokenPair(ctx, user, data.FamilyID)
 	if err != nil {
 		return nil, err
+	}
+	claims, err := s.ValidateToken(pair.AccessToken)
+	if err != nil || claims.RevocationMarker != data.RevocationMarker {
+		_ = s.RevokeRefreshToken(ctx, pair.RefreshToken)
+		return nil, ErrTokenRevoked
 	}
 	return &TokenPairWithUser{
 		TokenPair: *pair,
@@ -1892,20 +1925,45 @@ func (s *AuthService) RevokeAllUserSessions(ctx context.Context, userID int64) e
 	return s.refreshTokenCache.DeleteUserRefreshTokens(ctx, userID)
 }
 
-// RevokeAllUserTokens invalidates both stateless access tokens and refresh sessions.
-//
-// 注意：users 表没有 token_version 列（resolvedTokenVersion 由 email+password_hash
-// 指纹推导），因此对 user.TokenVersion 自增只影响内存副本。之前紧跟其后的整行
-// Update 不写任何有效数据，却会用旧快照覆盖并发写入的列，故已移除。
-// 会话撤销由下面的 refresh session 清理承担；改密路径通过 password_hash 变化
-// 改变指纹，从而使旧 token 失效。
+// RevokeAllUserTokens invalidates access tokens via the shared revocation marker
+// and deletes refresh sessions without relying on an unpersisted token version.
 func (s *AuthService) RevokeAllUserTokens(ctx context.Context, userID int64) error {
 	if _, err := s.userRepo.GetByID(ctx, userID); err != nil {
 		return fmt.Errorf("get user: %w", err)
 	}
 
+	store, ok := s.refreshTokenCache.(AccessTokenRevocationStore)
+	if !ok {
+		return ErrServiceUnavailable
+	}
+	marker, err := randomHexString(16)
+	if err != nil {
+		return err
+	}
+	if err := store.SetAccessTokenRevocation(ctx, userID, marker, 0); err != nil {
+		return fmt.Errorf("revoke access tokens: %w", err)
+	}
 	if err := s.RevokeAllUserSessions(ctx, userID); err != nil {
-		logger.LegacyPrintf("service.auth", "[Auth] Failed to revoke refresh sessions after token invalidation for user %d: %v", userID, err)
+		return fmt.Errorf("revoke refresh tokens: %w", err)
+	}
+	return nil
+}
+
+func (s *AuthService) accessTokenRevocationMarker(ctx context.Context, userID int64) (string, error) {
+	store, ok := s.refreshTokenCache.(AccessTokenRevocationStore)
+	if !ok {
+		return "", nil
+	}
+	return store.GetAccessTokenRevocation(ctx, userID)
+}
+
+func (s *AuthService) CheckAccessTokenRevocation(ctx context.Context, claims *JWTClaims) error {
+	marker, err := s.accessTokenRevocationMarker(ctx, claims.UserID)
+	if err != nil {
+		return ErrServiceUnavailable
+	}
+	if marker != claims.RevocationMarker {
+		return ErrTokenRevoked
 	}
 	return nil
 }

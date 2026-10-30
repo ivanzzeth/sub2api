@@ -305,6 +305,43 @@ func TestCheckUserPlatformQuotaEligibility_NoRecordMeansUnlimited(t *testing.T) 
 	}
 }
 
+// 新额度行在数据库里的窗口起点为 NULL。首次 MISS 回填后，第一笔计费的
+// Redis 用量必须在下一次 HIT 中参与限额检查。
+func TestCheckUserPlatformQuotaEligibility_NewQuotaRowKeepsFirstCharge(t *testing.T) {
+	limit := 0.19
+	for _, tc := range []struct {
+		name        string
+		setLimit    func(*UserPlatformQuotaRecord)
+		charge      func(*UserPlatformQuotaCacheEntry)
+		windowStart func(*UserPlatformQuotaCacheEntry) *time.Time
+		want        error
+	}{
+		{"daily", func(r *UserPlatformQuotaRecord) { r.DailyLimitUSD = &limit }, func(e *UserPlatformQuotaCacheEntry) { e.DailyUsageUSD = 0.2 }, func(e *UserPlatformQuotaCacheEntry) *time.Time { return e.DailyWindowStart }, ErrUserPlatformDailyQuotaExhausted},
+		{"weekly", func(r *UserPlatformQuotaRecord) { r.WeeklyLimitUSD = &limit }, func(e *UserPlatformQuotaCacheEntry) { e.WeeklyUsageUSD = 0.2 }, func(e *UserPlatformQuotaCacheEntry) *time.Time { return e.WeeklyWindowStart }, ErrUserPlatformWeeklyQuotaExhausted},
+		{"monthly", func(r *UserPlatformQuotaRecord) { r.MonthlyLimitUSD = &limit }, func(e *UserPlatformQuotaCacheEntry) { e.MonthlyUsageUSD = 0.2 }, func(e *UserPlatformQuotaCacheEntry) *time.Time { return e.MonthlyWindowStart }, ErrUserPlatformMonthlyQuotaExhausted},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := &UserPlatformQuotaRecord{UserID: 1, Platform: "openai"}
+			tc.setLimit(rec)
+			cache := &fakeFullCache{}
+			svc := newServiceForPreflight(t, &fakeQuotaRepo{rec: rec}, cache)
+			if err := svc.checkUserPlatformQuotaEligibility(context.Background(), 1, "openai"); err != nil {
+				t.Fatalf("new quota should allow first request: %v", err)
+			}
+			cache.mu.Lock()
+			if cache.entry == nil || tc.windowStart(cache.entry) == nil {
+				cache.mu.Unlock()
+				t.Fatal("new quota cache has no window start")
+			}
+			tc.charge(cache.entry) // 模拟首笔真实计费写入 Redis
+			cache.mu.Unlock()
+			if err := svc.checkUserPlatformQuotaEligibility(context.Background(), 1, "openai"); !errors.Is(err, tc.want) {
+				t.Fatalf("second request must be rejected after first charge: %v", err)
+			}
+		})
+	}
+}
+
 // TestCheckUserPlatformQuotaEligibility_OldSchemaCacheMissTriggersDB 验证旧版 entry（SchemaVersion=0）
 // 触发 DB 回退路径，并在 DB 数据判断配额是否超限。
 // DB record 需设置有效的 window_start，否则 quotaWindowExpired 会将 usage 归零（nil 窗口视为已过期）。

@@ -380,7 +380,7 @@ func (h *PaymentHandler) GetOrder(c *gin.Context) {
 		response.ErrorFrom(c, err)
 		return
 	}
-	response.Success(c, sanitizePaymentOrderForResponse(order))
+	response.Success(c, paymentOrderDetailForResponse(order))
 }
 
 // CancelOrder cancels a pending order for the authenticated user.
@@ -650,6 +650,8 @@ type PaymentOrderResult struct {
 	RefundRequestReason *string    `json:"refund_request_reason,omitempty"`
 	PlanID              *int64     `json:"plan_id,omitempty"`
 	ProviderInstanceID  *string    `json:"provider_instance_id,omitempty"`
+	PayURL              *string    `json:"pay_url,omitempty"`
+	QRCode              *string    `json:"qr_code,omitempty"`
 }
 
 func sanitizePaymentOrdersForResponse(orders []*dbent.PaymentOrder) []PaymentOrderResult {
@@ -660,6 +662,15 @@ func sanitizePaymentOrdersForResponse(orders []*dbent.PaymentOrder) []PaymentOrd
 		}
 	}
 	return out
+}
+
+func paymentOrderDetailForResponse(order *dbent.PaymentOrder) *PaymentOrderResult {
+	result := sanitizePaymentOrderForResponse(order)
+	if result != nil && order.Status == payment.OrderStatusPending && order.ExpiresAt.After(time.Now()) {
+		result.PayURL = order.PayURL
+		result.QRCode = order.QrCode
+	}
+	return result
 }
 
 func sanitizePaymentOrderForResponse(order *dbent.PaymentOrder) *PaymentOrderResult {

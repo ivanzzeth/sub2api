@@ -107,7 +107,11 @@ const (
 
 // isOpenAIImageModel checks if the model is an OpenAI image generation model (e.g. gpt-image-2).
 func isOpenAIImageModel(model string) bool {
-	return strings.HasPrefix(strings.ToLower(model), "gpt-image-")
+	_, routedModel, routed := strings.Cut(model, "/")
+	if routed {
+		model = routedModel
+	}
+	return !strings.Contains(model, "/") && strings.HasPrefix(strings.ToLower(model), "gpt-image-")
 }
 
 func isGrokVideoGenerationModel(model string) bool {
@@ -814,6 +818,16 @@ func (s *AccountTestService) testOpenAIAccountConnection(c *gin.Context, account
 	testModelID = account.GetMappedModel(testModelID)
 	if mode == AccountTestModeCompact {
 		return s.testOpenAICompactConnection(c, account, testModelID)
+	}
+	if mode == AccountTestModeOpenAIImage {
+		imagePrompt := strings.TrimSpace(prompt)
+		if imagePrompt == "" {
+			imagePrompt = defaultOpenAIImageTestPrompt
+		}
+		if account.Type == "apikey" {
+			return s.testOpenAIImageAPIKey(c, ctx, account, testModelID, imagePrompt)
+		}
+		return s.testOpenAIImageOAuth(c, ctx, account, testModelID, imagePrompt)
 	}
 
 	// Route to image generation test if an image model is selected

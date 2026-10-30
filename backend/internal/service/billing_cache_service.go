@@ -1395,6 +1395,23 @@ func (s *BillingCacheService) checkUserPlatformQuotaEligibility(
 	if monthlyQuotaWindowExpired(rec.MonthlyWindowStart, now) {
 		monthlyUsage = 0
 	}
+	// 新建额度行的窗口起点在数据库中为 NULL。回填缓存时给当前窗口起点，
+	// 否则首笔计费虽累加到 Redis，下一笔 HIT 仍因 NULL 起点将用量清零。
+	dailyStart := rec.DailyWindowStart
+	if quotaWindowExpired(dailyStart, timezone.StartOfDay(now)) {
+		start := timezone.StartOfDay(now)
+		dailyStart = &start
+	}
+	weeklyStart := rec.WeeklyWindowStart
+	if quotaWindowExpired(weeklyStart, timezone.StartOfWeek(now)) {
+		start := timezone.StartOfWeek(now)
+		weeklyStart = &start
+	}
+	monthlyStart := rec.MonthlyWindowStart
+	if monthlyQuotaWindowExpired(monthlyStart, now) {
+		start := now
+		monthlyStart = &start
+	}
 
 	// Redis 故障时 fail-open：不回填，直接用 DB 数据做一次性检查
 	if cacheErr != nil {
@@ -1419,9 +1436,9 @@ func (s *BillingCacheService) checkUserPlatformQuotaEligibility(
 		DailyLimitUSD:      rec.DailyLimitUSD,
 		WeeklyLimitUSD:     rec.WeeklyLimitUSD,
 		MonthlyLimitUSD:    rec.MonthlyLimitUSD,
-		DailyWindowStart:   rec.DailyWindowStart,
-		WeeklyWindowStart:  rec.WeeklyWindowStart,
-		MonthlyWindowStart: rec.MonthlyWindowStart,
+		DailyWindowStart:   dailyStart,
+		WeeklyWindowStart:  weeklyStart,
+		MonthlyWindowStart: monthlyStart,
 	}
 	if s.cache != nil {
 		ttl := time.Duration(s.cfg.Billing.UserPlatformQuotaCacheTTLSeconds) * time.Second

@@ -12,12 +12,13 @@ var ErrRefreshTokenNotFound = errors.New("refresh token not found")
 
 // RefreshTokenData 存储在Redis中的Refresh Token数据
 type RefreshTokenData struct {
-	UserID       int64     `json:"user_id"`
-	TokenVersion int64     `json:"token_version"`          // 用于检测密码更改后的Token失效
-	FamilyID     string    `json:"family_id"`              // Token家族ID，用于防重放攻击
-	BindingHash  string    `json:"binding_hash,omitempty"` // 会话指纹哈希（IP+UA），会话绑定开启时校验
-	CreatedAt    time.Time `json:"created_at"`
-	ExpiresAt    time.Time `json:"expires_at"`
+	UserID           int64     `json:"user_id"`
+	TokenVersion     int64     `json:"token_version"` // 用于检测密码更改后的Token失效
+	RevocationMarker string    `json:"revocation_marker,omitempty"`
+	FamilyID         string    `json:"family_id"`              // Token家族ID，用于防重放攻击
+	BindingHash      string    `json:"binding_hash,omitempty"` // 会话指纹哈希（IP+UA），会话绑定开启时校验
+	CreatedAt        time.Time `json:"created_at"`
+	ExpiresAt        time.Time `json:"expires_at"`
 }
 
 // RefreshTokenCache 管理Refresh Token的Redis缓存
@@ -71,4 +72,9 @@ type RefreshTokenCache interface {
 	// IsTokenInFamily 检查Token是否属于指定家族
 	// 用于验证Token家族关系
 	IsTokenInFamily(ctx context.Context, familyID string, tokenHash string) (bool, error)
+}
+
+type AccessTokenRevocationStore interface {
+	GetAccessTokenRevocation(ctx context.Context, userID int64) (string, error)
+	SetAccessTokenRevocation(ctx context.Context, userID int64, marker string, ttl time.Duration) error
 }

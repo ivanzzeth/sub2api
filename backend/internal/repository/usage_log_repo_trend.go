@@ -277,6 +277,38 @@ func (r *usageLogRepository) GetUsageTrendWithFilters(ctx context.Context, start
 	return r.getUsageTrendWithFilters(ctx, startTime, endTime, granularity, userID, apiKeyID, accountID, groupID, model, "", requestType, stream, billingType, "", nil, nil)
 }
 
+func (r *usageLogRepository) GetAPIKeyDailyUsageInLocation(ctx context.Context, userID, apiKeyID int64, startTime, endTime time.Time) (results []TrendDataPoint, err error) {
+	query := `
+		SELECT
+			TO_CHAR(created_at AT TIME ZONE $3, 'YYYY-MM-DD') as date,
+			COUNT(*) as requests,
+			COALESCE(SUM(input_tokens), 0) as input_tokens,
+			COALESCE(SUM(output_tokens), 0) as output_tokens,
+			COALESCE(SUM(cache_creation_tokens), 0) as cache_creation_tokens,
+			COALESCE(SUM(cache_read_tokens), 0) as cache_read_tokens,
+			COALESCE(SUM(input_tokens + output_tokens + cache_creation_tokens + cache_read_tokens), 0) as total_tokens,
+			COALESCE(SUM(total_cost), 0) as cost,
+			COALESCE(SUM(actual_cost), 0) as actual_cost
+		FROM usage_logs
+		WHERE created_at >= $1 AND created_at < $2 AND user_id = $4 AND api_key_id = $5
+		GROUP BY date ORDER BY date ASC`
+	rows, err := r.sql.QueryContext(ctx, query, startTime, endTime, startTime.Location().String(), userID, apiKeyID)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil && err == nil {
+			err = closeErr
+			results = nil
+		}
+	}()
+	results, err = scanTrendRows(rows)
+	if err != nil {
+		return nil, err
+	}
+	return results, nil
+}
+
 func (r *usageLogRepository) GetUsageTrendWithUsageFilters(ctx context.Context, startTime, endTime time.Time, granularity string, filters UsageLogFilters) (results []TrendDataPoint, err error) {
 	return r.getUsageTrendWithFilters(ctx, startTime, endTime, granularity, filters.UserID, filters.APIKeyID, filters.AccountID, filters.GroupID, filters.Model, filters.ModelFilterSource, filters.RequestType, filters.Stream, filters.BillingType, filters.BillingMode, filters.UpstreamModelMismatch, filters.NativeCompactionV2)
 }

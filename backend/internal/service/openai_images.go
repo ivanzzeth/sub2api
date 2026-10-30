@@ -635,7 +635,10 @@ func (s *OpenAIGatewayService) forwardOpenAIImagesAPIKey(
 	}
 	upstreamModel := account.GetMappedModel(requestModel)
 	if err := validateCompatibleImagesModel(upstreamModel); err != nil {
-		return nil, err
+		prefix, imageModel, prefixed := strings.Cut(upstreamModel, "/")
+		if !prefixed || prefix == "" || imageModel == "" || validateCompatibleImagesModel(imageModel) != nil {
+			return nil, err
+		}
 	}
 	SetOpsUpstreamModel(c, upstreamModel)
 	logger.LegacyPrintf(

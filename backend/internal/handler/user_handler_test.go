@@ -417,6 +417,16 @@ type userHandlerEmailCacheStub struct {
 
 type userHandlerRefreshTokenCacheStub struct {
 	revokedUserIDs []int64
+	marker         string
+}
+
+func (s *userHandlerRefreshTokenCacheStub) GetAccessTokenRevocation(context.Context, int64) (string, error) {
+	return s.marker, nil
+}
+
+func (s *userHandlerRefreshTokenCacheStub) SetAccessTokenRevocation(_ context.Context, _ int64, marker string, _ time.Duration) error {
+	s.marker = marker
+	return nil
 }
 
 func (s *userHandlerRefreshTokenCacheStub) StoreRefreshToken(context.Context, string, *service.RefreshTokenData, time.Duration) error {

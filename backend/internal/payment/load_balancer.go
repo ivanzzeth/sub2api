@@ -83,7 +83,7 @@ type instanceCandidate struct {
 //  2. Batch-query daily usage (PENDING + PAID + COMPLETED + RECHARGING) for all candidates
 //  3. Filter out instances where: single-min/max violated OR daily remaining < orderAmount
 //  4. Pick from survivors using the configured strategy (round-robin / least-amount)
-//  5. If all filtered out, fall back to full list (let the provider itself reject)
+//  5. If all filtered out, return nil so the caller can report no available instance
 func (lb *DefaultLoadBalancer) SelectInstance(
 	ctx context.Context,
 	providerKey string,
@@ -103,10 +103,10 @@ func (lb *DefaultLoadBalancer) SelectInstance(
 	// Step 3: filter by limits.
 	available := filterByLimits(candidates, paymentType, orderAmount)
 	if len(available) == 0 {
-		slog.Warn("all instances exceeded limits, using full candidate list",
+		slog.Warn("all instances exceeded limits",
 			"provider", providerKey, "payment_type", paymentType,
 			"order_amount", orderAmount, "count", len(candidates))
-		available = candidates
+		return nil, nil
 	}
 
 	// Step 4: pick by strategy.

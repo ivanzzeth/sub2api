@@ -3,12 +3,82 @@
 package payment
 
 import (
+	"context"
+	"database/sql"
 	"encoding/json"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
+	"entgo.io/ent/dialect"
+	entsql "entgo.io/ent/dialect/sql"
 	dbent "github.com/Wei-Shaw/sub2api/ent"
+	"github.com/Wei-Shaw/sub2api/ent/enttest"
+	_ "modernc.org/sqlite"
 )
+
+func TestSelectInstanceLimits(t *testing.T) {
+	database, err := sql.Open("sqlite", "file:payment_load_balancer_limits?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	database.SetMaxOpenConns(1)
+	if _, err := database.Exec("PRAGMA foreign_keys = ON"); err != nil {
+		t.Fatal(err)
+	}
+	client := enttest.NewClient(t, enttest.WithOptions(dbent.Driver(entsql.OpenDB(dialect.SQLite, database))))
+	t.Cleanup(func() { _ = client.Close() })
+	ctx := context.Background()
+	lb := NewDefaultLoadBalancer(client, nil)
+	limited, err := client.PaymentProviderInstance.Create().
+		SetProviderKey("easypay").SetName("limited").SetConfig("{}").
+		SetSupportedTypes("alipay").SetEnabled(true).
+		SetLimits(makeLimitsJSON("alipay", ChannelLimits{SingleMin: 2, SingleMax: 20, DailyLimit: 25})).
+		Save(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, amount := range []float64{1, 21} {
+		t.Run(fmt.Sprintf("single limit rejects %g", amount), func(t *testing.T) {
+			selection, err := lb.SelectInstance(ctx, "easypay", TypeAlipay, StrategyRoundRobin, amount)
+			if err != nil || selection != nil {
+				t.Fatalf("SelectInstance(%g) = %v, %v; want nil, nil", amount, selection, err)
+			}
+		})
+	}
+
+	selection, err := lb.SelectInstance(ctx, "easypay", TypeAlipay, StrategyRoundRobin, 2)
+	if err != nil || selection == nil || selection.InstanceID != fmt.Sprint(limited.ID) {
+		t.Fatalf("SelectInstance(2) = %v, %v; want limited instance", selection, err)
+	}
+
+	user, err := client.User.Create().SetEmail("test@example.com").SetPasswordHash("hash").Save(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.PaymentOrder.Create().
+		SetUser(user).SetUserEmail("test@example.com").SetUserName("test").
+		SetAmount(24).SetPayAmount(24).SetRechargeCode("balance").
+		SetOutTradeNo("limit-test-order").SetPaymentType("alipay").
+		SetPaymentTradeNo("").SetOrderType("balance").SetProviderInstanceID(fmt.Sprint(limited.ID)).
+		SetExpiresAt(time.Now().Add(time.Hour)).SetClientIP("127.0.0.1").SetSrcHost("localhost").
+		SetStatus(OrderStatusPending).Save(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selection, err = lb.SelectInstance(ctx, "easypay", TypeAlipay, StrategyLeastAmount, 2)
+	if err != nil || selection != nil {
+		t.Fatalf("daily limit selection = %v, %v; want nil, nil", selection, err)
+	}
+
+	selection, err = lb.SelectInstance(ctx, "missing", TypeAlipay, StrategyRoundRobin, 2)
+	if selection != nil || err == nil || !strings.Contains(err.Error(), "no enabled instance for payment type alipay") {
+		t.Fatalf("no-provider selection = %v, %v; want original no-provider error", selection, err)
+	}
+}
 
 func TestInstanceSupportsType(t *testing.T) {
 	t.Parallel()

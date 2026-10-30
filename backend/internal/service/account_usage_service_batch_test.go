@@ -55,6 +55,9 @@ func (r *usageBatchLogRepoStub) GetDashboardStats(context.Context) (*usagestats.
 func (r *usageBatchLogRepoStub) GetUsageTrendWithFilters(context.Context, time.Time, time.Time, string, int64, int64, int64, int64, string, *int16, *bool, *int8) ([]usagestats.TrendDataPoint, error) {
 	return nil, nil
 }
+func (r *usageBatchLogRepoStub) GetAPIKeyDailyUsageInLocation(context.Context, int64, int64, time.Time, time.Time) ([]usagestats.TrendDataPoint, error) {
+	return nil, nil
+}
 func (r *usageBatchLogRepoStub) GetModelStatsWithFilters(context.Context, time.Time, time.Time, int64, int64, int64, int64, *int16, *bool, *int8) ([]usagestats.ModelStat, error) {
 	return nil, nil
 }

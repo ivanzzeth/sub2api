@@ -43,6 +43,44 @@ type recordingActivityToucher struct {
 	userIDs []int64
 }
 
+type unavailableRevocationStore struct {
+	service.RefreshTokenCache
+	failed bool
+}
+
+func (store *unavailableRevocationStore) GetAccessTokenRevocation(context.Context, int64) (string, error) {
+	if store.failed {
+		return "", errors.New("revocation store unavailable")
+	}
+	return "", nil
+}
+
+func (store *unavailableRevocationStore) SetAccessTokenRevocation(context.Context, int64, string, time.Duration) error {
+	return nil
+}
+
+func TestJWTAuthFailsClosedWhenRevocationStoreIsUnavailable(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	user := &service.User{ID: 91, Email: "customer@example.test", Role: "user", Status: service.StatusActive, TokenVersion: 1, TokenVersionResolved: true}
+	config := &config.Config{}
+	config.JWT.Secret = "test-jwt-secret-32bytes-long!!!"
+	config.JWT.AccessTokenExpireMinutes = 60
+	store := &unavailableRevocationStore{}
+	userRepo := &stubJWTUserRepo{users: map[int64]*service.User{user.ID: user}}
+	authService := service.NewAuthService(nil, userRepo, nil, store, config, nil, nil, nil, nil, nil, nil, nil, nil)
+	token, err := authService.GenerateToken(context.Background(), user)
+	require.NoError(t, err)
+	store.failed = true
+	router := gin.New()
+	router.Use(jwtAuth(authService, userRepo, nil, nil, nil))
+	router.GET("/protected", func(c *gin.Context) { c.Status(http.StatusOK) })
+	request := httptest.NewRequest(http.MethodGet, "/protected", nil)
+	request.Header.Set("Authorization", "Bearer "+token)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	require.Equal(t, http.StatusServiceUnavailable, response.Code)
+}
+
 func (r *recordingActivityToucher) TouchLastActiveForUser(_ context.Context, user *service.User) {
 	if user == nil {
 		return

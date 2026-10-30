@@ -45,8 +45,12 @@ func NewDefaultBatchImageProviderRegistry() *BatchImageProviderRegistry {
 }
 
 func NewBatchImageProviderRegistryFromConfig(cfg *config.Config) *BatchImageProviderRegistry {
+	var geminiClient GeminiBatchClient
+	if cfg != nil && strings.TrimSpace(cfg.BatchImage.GeminiBaseURL) != "" {
+		geminiClient = NewGeminiBatchHTTPClient(cfg.BatchImage.GeminiBaseURL, nil)
+	}
 	return NewBatchImageProviderRegistry(
-		NewGeminiAPIBatchImageProvider(nil),
+		NewGeminiAPIBatchImageProvider(geminiClient),
 		NewVertexBatchImageProviderFromConfig(cfg, nil, nil, nil),
 	)
 }

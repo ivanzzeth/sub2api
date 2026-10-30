@@ -1427,6 +1427,45 @@ func TestAPIKeyAuthRejectsExhaustedBalance(t *testing.T) {
 	requireAPIKeyAuthError(t, w, "INSUFFICIENT_BALANCE", "Insufficient account balance")
 }
 
+func TestAPIKeyAuthModelDiscoverySkipsBillingButNotAuthentication(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	user := &service.User{ID: 10, Role: service.RoleUser, Status: service.StatusActive, Balance: 0}
+	apiKey := &service.APIKey{ID: 104, UserID: user.ID, Key: "zero-balance-models", Status: service.StatusActive, User: user}
+	apiKeyRepo := &stubApiKeyRepo{getByKey: func(_ context.Context, key string) (*service.APIKey, error) {
+		if key != apiKey.Key {
+			return nil, service.ErrAPIKeyNotFound
+		}
+		clone := *apiKey
+		return &clone, nil
+	}}
+	cfg := &config.Config{RunMode: config.RunModeStandard}
+	router := gin.New()
+	router.Use(gin.HandlerFunc(NewAPIKeyAuthMiddleware(service.NewAPIKeyService(apiKeyRepo, nil, nil, nil, nil, nil, cfg), nil, cfg)))
+	ok := func(c *gin.Context) { c.Status(http.StatusOK) }
+	router.GET("/v1/models", ok)
+	router.GET("/v1/models/:model", ok)
+	router.POST("/v1/chat/completions", ok)
+
+	for _, test := range []struct {
+		name, method, path, key string
+		status                  int
+	}{
+		{"list without balance", http.MethodGet, "/v1/models", apiKey.Key, http.StatusOK},
+		{"detail without balance", http.MethodGet, "/v1/models/example", apiKey.Key, http.StatusOK},
+		{"invalid key still rejected", http.MethodGet, "/v1/models", "invalid", http.StatusUnauthorized},
+		{"detail with invalid key rejected", http.MethodGet, "/v1/models/example", "invalid", http.StatusUnauthorized},
+		{"inference still requires balance", http.MethodPost, "/v1/chat/completions", apiKey.Key, http.StatusForbidden},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			request := httptest.NewRequest(test.method, test.path, nil)
+			request.Header.Set("Authorization", "Bearer "+test.key)
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, request)
+			require.Equal(t, test.status, response.Code, response.Body.String())
+		})
+	}
+}
+
 func TestAPIKeyAuthOpenAIQuotaErrorFormat(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 

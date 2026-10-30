@@ -2,6 +2,8 @@ package repository
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"time"
@@ -14,6 +16,7 @@ const (
 	refreshTokenKeyPrefix   = "refresh_token:"
 	userRefreshTokensPrefix = "user_refresh_tokens:"
 	tokenFamilyPrefix       = "token_family:"
+	accessRevocationPrefix  = "access_revocation:"
 )
 
 // refreshTokenKey generates the Redis key for a refresh token.
@@ -95,6 +98,26 @@ func (c *refreshTokenCache) DeleteUserRefreshTokens(ctx context.Context, userID 
 	}
 	_, err = pipe.Exec(ctx)
 	return err
+}
+
+func (c *refreshTokenCache) GetAccessTokenRevocation(ctx context.Context, userID int64) (string, error) {
+	key := fmt.Sprintf("%s%d", accessRevocationPrefix, userID)
+	marker, err := c.rdb.Get(ctx, key).Result()
+	if err != redis.Nil {
+		return marker, err
+	}
+	seed := make([]byte, 16)
+	if _, err := rand.Read(seed); err != nil {
+		return "", err
+	}
+	if err := c.rdb.SetNX(ctx, key, hex.EncodeToString(seed), 0).Err(); err != nil {
+		return "", err
+	}
+	return c.rdb.Get(ctx, key).Result()
+}
+
+func (c *refreshTokenCache) SetAccessTokenRevocation(ctx context.Context, userID int64, marker string, ttl time.Duration) error {
+	return c.rdb.Set(ctx, fmt.Sprintf("%s%d", accessRevocationPrefix, userID), marker, 0).Err()
 }
 
 func (c *refreshTokenCache) DeleteTokenFamily(ctx context.Context, familyID string) error {
