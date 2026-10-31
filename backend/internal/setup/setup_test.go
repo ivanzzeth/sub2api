@@ -106,6 +106,23 @@ func TestNeedsSetupSkipsWhenSkipSetupIsEnabled(t *testing.T) {
 	}
 }
 
+// emptyDir 重建后 config.yaml / .installed 都没了，必须再走 AUTO_SETUP（对已有库幂等）。
+func TestNeedsSetupTrueWhenEphemeralDataDirIsEmpty(t *testing.T) {
+	t.Setenv("DATA_DIR", t.TempDir())
+	originalValue, wasSet := os.LookupEnv("SKIP_SETUP")
+	if err := os.Unsetenv("SKIP_SETUP"); err != nil {
+		t.Fatalf("Unsetenv(SKIP_SETUP) error = %v", err)
+	}
+	t.Cleanup(func() {
+		if wasSet {
+			_ = os.Setenv("SKIP_SETUP", originalValue)
+		}
+	})
+	if !NeedsSetup() {
+		t.Fatal("empty DATA_DIR must need setup so AUTO_SETUP can rewrite config.yaml from env")
+	}
+}
+
 func TestNeedsSetupFallsBackToFileDetectionWhenSkipSetupIsDisabled(t *testing.T) {
 	tests := []struct {
 		name         string

@@ -613,7 +613,12 @@ func getEnvIntOrDefault(key string, defaultValue int) int {
 }
 
 // AutoSetupFromEnv performs automatic setup using environment variables
-// This is designed for Docker deployment where all config is passed via env vars
+// This is designed for Docker deployment where all config is passed via env vars.
+//
+// Ephemeral DATA_DIR (K8s emptyDir): NeedsSetup() is true again after every Pod
+// recreate. Re-running is intentional and must stay idempotent against an
+// already-migrated database (migrations no-op, admin bootstrap skips existing
+// users) while rewriting config.yaml from env so the process can boot.
 func AutoSetupFromEnv() error {
 	logger.LegacyPrintf("setup", "%s", "Auto setup enabled, configuring from environment variables...")
 	logger.LegacyPrintf("setup", "Data directory: %s", GetDataDir())
