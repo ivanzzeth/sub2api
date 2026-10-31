@@ -267,8 +267,9 @@ var ErrModelPricingUnavailable = errors.New("pricing not found")
 // ---- DeepSeek 官方低谷价（$/token）----
 // 2026-09-10 官方公告：DeepSeek-V4.1-Flash（新名 deepseek-flash）大幅降价，
 // Flash 低谷价降为 $0.15/$0.60/$0.003 per MTok（输入缓存未命中/输出/缓存命中）；
-// deepseek-v4-pro 名义价格暂不变，但自北京时间 2026-09-14 12:00（04:00 UTC）起
-// 其请求被上游路由到 V4.1-Flash 并按 Flash 价计费（见 deepseekProBilledAsFlash）。
+// deepseek-v4-pro 在 2026-09-14～恢复分列前曾被上游临时路由到 V4.1-Flash
+// 并按 Flash 价计费（见 deepseekProBilledAsFlash）。现行官方价卡已重新分列
+// Pro / Flash，窗口外（含当前时刻）一律按 Pro 价。
 // Source: https://api-docs.deepseek.com/news/news260910
 //
 //	https://api-docs.deepseek.com/quick_start/pricing
@@ -285,13 +286,12 @@ const (
 )
 
 // isDeepSeekModel 判断模型名是否为 DeepSeek 模型（大小写不敏感）。
-// 任意 deepseek- 前缀均视为 DeepSeek 模型：官方模型（v4-flash / v4-pro /
-// v4-flash-vision-exp）按各自价卡计价，其余 deepseek-*（含已停服的
-// deepseek-chat / deepseek-reasoner 与未知型号）统一按 flash 价兜底，
-// 避免计费中断；新名字由 fallback warn 日志（每模型每进程一条）暴露，
-// 运营者据此更新价卡。
+// deepseek- 与 deepseek/（网关/聚合商前缀，如 deepseek/deepseek-v4-pro）
+// 均视为 DeepSeek：官方型号按各自价卡计价，其余 deepseek-* 统一按 flash
+// 价兜底，避免计费中断；新名字由 fallback warn 日志暴露，运营者据此更新价卡。
 func isDeepSeekModel(model string) bool {
-	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(model)), "deepseek-")
+	name := strings.ToLower(strings.TrimSpace(model))
+	return strings.HasPrefix(name, "deepseek-") || strings.HasPrefix(name, "deepseek/")
 }
 
 // deepseekPeakMultiplierAt 返回指定时刻的 DeepSeek 官方峰谷定价因子。
@@ -312,18 +312,23 @@ func deepseekPeakMultiplierAt(now time.Time) float64 {
 }
 
 // deepseekProRoutesToFlashAt：官方公告自北京时间 2026-09-14 12:00（04:00 UTC）起，
-// 所有 deepseek-v4-pro 请求被上游路由到 V4.1-Flash 并按 Flash 价计费（直至未来
-// V4.1 Pro 上线）。Source: https://api-docs.deepseek.com/news/news260910
+// 所有 deepseek-v4-pro 请求被上游临时路由到 V4.1-Flash 并按 Flash 价计费。
+// Source: https://api-docs.deepseek.com/news/news260910
 var deepseekProRoutesToFlashAt = time.Date(2026, 9, 14, 4, 0, 0, 0, time.UTC)
 
-// deepseekProBilledAsFlash 报告指定计费时点 deepseek-v4-pro 是否已按 Flash 价
-// 计费：计费时点到达或晚于切换时点返回 true；零值时点回退当前时刻（与峰谷
-// 倍率的取时点方式一致，见 calculateTokenCost）。
+// deepseekProFlashRoutingEndsAt：临时 Flash 路由结束。现行官方价卡已重新分列
+// deepseek-v4-pro（DeepSeek-V4-Pro-0813）与 deepseek-flash，窗口外按 Pro 价。
+// Source: https://api-docs.deepseek.com/quick_start/pricing（2026-10-31 核验）
+var deepseekProFlashRoutingEndsAt = time.Date(2026, 10, 31, 0, 0, 0, 0, time.UTC)
+
+// deepseekProBilledAsFlash 报告指定计费时点 deepseek-v4-pro 是否按 Flash 价计费。
+// 仅 [RoutesToFlashAt, FlashRoutingEndsAt) 半开窗口为 true；零值时点回退当前时刻
+// （与峰谷倍率的取时点方式一致，见 calculateTokenCost）。窗口外（含当前）按 Pro 价。
 func deepseekProBilledAsFlash(pricingAt time.Time) bool {
 	if pricingAt.IsZero() {
 		pricingAt = timezone.Now()
 	}
-	return !pricingAt.Before(deepseekProRoutesToFlashAt)
+	return !pricingAt.Before(deepseekProRoutesToFlashAt) && pricingAt.Before(deepseekProFlashRoutingEndsAt)
 }
 
 // isDeepSeekProModel 判断模型名是否归入 deepseek-v4-pro 档（含版本化名称，
@@ -1910,12 +1915,11 @@ func (s *BillingService) applyModelSpecificPricingPolicyEx(model string, pricing
 	// （Flash 三档为 2026-09-10 官方降价后口径）。这是覆盖远端旧价的关键——远端
 	// 仓库不可改，生产会先拉到旧价，必须在此兜底修正；克隆后再覆盖，避免污染
 	// 共享 fallbackPrices 指针。
-	// 档位判定：含 "deepseek-v4-pro" 的版本化名称（如 deepseek-v4-pro-0813）归 pro 档，
-	// 其余 deepseek-*（含已停服的 chat/reasoner 与未知型号）统一归 flash 档。
-	// 2026-09-14 04:00 UTC 起上游把 pro 请求路由到 V4.1-Flash，pro 档改按
-	// Flash 三档价计费；历史时点（早于切换时刻）仍按 Pro 价。
-	// 高峰时段倍率不在本函数处理，由 calculateTokenCost 按 deepseekPeakMultiplierAt
-	// 对默认价卡另行叠加（分组/渠道自定义定价不叠加）。
+	// 档位判定：含 "deepseek-v4-pro" 的版本化名称（如 deepseek-v4-pro-0813、
+	// deepseek/deepseek-v4-pro）归 pro 档，其余 deepseek-* 统一归 flash 档。
+	// 仅临时 Flash 路由窗口内（见 deepseekProBilledAsFlash）把 pro 改按 Flash
+	// 三档价；窗口外（含当前官方分列）按 Pro 价。高峰倍率不在本函数处理，
+	// 由 calculateTokenCost 按 deepseekPeakMultiplierAt 另行叠加。
 	if forceDeepSeekRates && isDeepSeekModel(model) {
 		cloned := *pricing
 		if isDeepSeekProModel(model) && !deepseekProBilledAsFlash(pricingAt) {
@@ -1925,7 +1929,7 @@ func (s *BillingService) applyModelSpecificPricingPolicyEx(model string, pricing
 		} else {
 			// deepseek-flash（= V4.1-Flash）、deepseek-v4-flash /
 			// deepseek-v4-flash-vision-exp 与其余 deepseek-* 共用 flash 价；
-			// 切换时点之后的 pro 请求同样按 flash 价计费。
+			// 临时路由窗口内的 pro 请求同样按 flash 价计费。
 			cloned.InputPricePerToken = deepseekFlashOffPeakInputPrice
 			cloned.OutputPricePerToken = deepseekFlashOffPeakOutputPrice
 			cloned.CacheReadPricePerToken = deepseekFlashOffPeakCacheRead
