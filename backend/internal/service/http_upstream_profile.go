@@ -16,6 +16,7 @@ const (
 type httpUpstreamProfileContextKey struct{}
 type httpUpstreamDisableRedirectsContextKey struct{}
 type httpUpstreamPublicHostsOnlyContextKey struct{}
+type httpUpstreamVoiceSingleAttemptContextKey struct{}
 
 // WithHTTPUpstreamProfile injects an upstream transport profile into ctx.
 func WithHTTPUpstreamProfile(ctx context.Context, profile HTTPUpstreamProfile) context.Context {
@@ -71,4 +72,16 @@ func WithHTTPUpstreamPublicHostsOnly(ctx context.Context) context.Context {
 
 func HTTPUpstreamPublicHostsOnly(ctx context.Context) bool {
 	return ctx != nil && ctx.Value(httpUpstreamPublicHostsOnlyContextKey{}) == true
+}
+
+// WithHTTPUpstreamVoiceSingleAttempt marks only unsafe buffered Voice writes.
+func WithHTTPUpstreamVoiceSingleAttempt(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, httpUpstreamVoiceSingleAttemptContextKey{}, true)
+}
+
+func HTTPUpstreamVoiceSingleAttempt(ctx context.Context) bool {
+	return ctx != nil && ctx.Value(httpUpstreamVoiceSingleAttemptContextKey{}) == true
 }

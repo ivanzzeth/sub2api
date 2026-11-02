@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -25,6 +26,17 @@ var supportedGrokVoiceHTTPEndpoints = map[string]struct{}{
 	"tts":           {},
 	"stt":           {},
 	"custom-voices": {},
+}
+
+// grokVoiceAttemptError preserves native error classification while preventing
+// a second account from replaying an unsafe request after a possible wire write.
+type grokVoiceAttemptError struct{ err error }
+
+func (e *grokVoiceAttemptError) Error() string { return e.err.Error() }
+func (e *grokVoiceAttemptError) Unwrap() error { return e.err }
+func GrokVoiceRequestAttempted(err error) bool {
+	var attempted *grokVoiceAttemptError
+	return errors.As(err, &attempted)
 }
 
 // ForwardGrokVoice forwards the official xAI Voice HTTP APIs (/tts, /stt, and
@@ -71,6 +83,11 @@ func (s *OpenAIGatewayService) ForwardGrokVoice(ctx context.Context, c *gin.Cont
 	if c != nil && c.Request != nil && strings.TrimSpace(c.Request.Method) != "" {
 		method = c.Request.Method
 	}
+	unsafe := method == http.MethodPost || method == http.MethodPatch || method == http.MethodDelete
+	upstreamCtx = WithHTTPUpstreamRedirectsDisabled(upstreamCtx)
+	if unsafe {
+		upstreamCtx = WithHTTPUpstreamVoiceSingleAttempt(upstreamCtx)
+	}
 	req, err := http.NewRequestWithContext(upstreamCtx, method, targetURL, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
@@ -87,6 +104,38 @@ func (s *OpenAIGatewayService) ForwardGrokVoice(ctx context.Context, c *gin.Cont
 		applyGrokCLIHeaders(req.Header)
 	}
 	account.ApplyHeaderOverrides(req.Header)
+	// Fresh server requests never copy the customer's pin or authentication headers.
+	// Canonical vendor/CLI targets must not receive an internal Proxy credential ID.
+	target, _ := url.Parse(targetURL)
+	if target != nil && (strings.EqualFold(target.Hostname(), "api.x.ai") || isGrokCLIProxyTarget(targetURL)) {
+		for key := range req.Header {
+			if strings.EqualFold(key, "X-CLIProxy-Auth-ID") {
+				delete(req.Header, key)
+			}
+		}
+	}
+	if unsafe {
+		headers := []http.Header{req.Header}
+		if c != nil && c.Request != nil {
+			headers = append(headers, c.Request.Header)
+		}
+		for _, header := range headers {
+			for key := range header {
+				if strings.EqualFold(key, "Idempotency-Key") || strings.EqualFold(key, "X-Idempotency-Key") {
+					MarkResponseCommitted(c)
+					writeGrokMediaErrorResponse(c, http.StatusBadRequest, "invalid_request_error", "Idempotency headers are not supported for unsafe Voice requests")
+					return nil, fmt.Errorf("unsafe voice idempotency header rejected")
+				}
+			}
+		}
+		req.GetBody = nil
+	}
+	wrapAttempt := func(err error) error {
+		if unsafe && err != nil {
+			return &grokVoiceAttemptError{err: err}
+		}
+		return err
+	}
 
 	proxyURL := ""
 	if account.ProxyID != nil && account.Proxy != nil {
@@ -96,15 +145,32 @@ func (s *OpenAIGatewayService) ForwardGrokVoice(ctx context.Context, c *gin.Cont
 	resp, err := s.httpUpstream.Do(req, proxyURL, account.ID, account.Concurrency)
 	SetOpsLatencyMs(c, OpsUpstreamLatencyMsKey, time.Since(started).Milliseconds())
 	if err != nil {
-		return nil, s.handleOpenAIUpstreamTransportError(ctx, c, account, err, false)
+		return nil, wrapAttempt(s.handleOpenAIUpstreamTransportError(ctx, c, account, err, false))
 	}
 	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		data, readErr := ReadUpstreamResponseBody(resp.Body, s.cfg, c, openAITooLargeError)
+		if readErr != nil {
+			return nil, wrapAttempt(readErr)
+		}
+		MarkResponseCommitted(c)
+		if c != nil {
+			for _, name := range []string{"Location", "Retry-After", "x-request-id"} {
+				if value := resp.Header.Get(name); value != "" {
+					c.Header(name, value)
+				}
+			}
+		}
+		writeGrokMediaResponse(c, resp, data, s.responseHeaderFilter)
+		return nil, wrapAttempt(fmt.Errorf("voice upstream returned terminal redirect status %d", resp.StatusCode))
+	}
 	if resp.StatusCode >= 400 {
-		return s.handleGrokMediaErrorResponse(ctx, resp, c, account, resp.Header.Get("x-request-id"), endpoint)
+		result, responseErr := s.handleGrokMediaErrorResponse(ctx, resp, c, account, resp.Header.Get("x-request-id"), endpoint)
+		return result, wrapAttempt(responseErr)
 	}
 	data, err := ReadUpstreamResponseBody(resp.Body, s.cfg, c, openAITooLargeError)
 	if err != nil {
-		return nil, err
+		return nil, wrapAttempt(err)
 	}
 	writeGrokMediaResponse(c, resp, data, s.responseHeaderFilter)
 	audioUsage := estimateGrokVoiceAudioUsage(baseEndpoint, body, contentType, data, time.Since(started))

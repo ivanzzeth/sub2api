@@ -294,6 +294,16 @@ func (h *OpenAIGatewayHandler) GrokVoice(c *gin.Context, endpoint string) {
 			return
 		}
 		var failoverErr *service.UpstreamFailoverError
+		if service.GrokVoiceRequestAttempted(forwardErr) {
+			if !c.Writer.Written() && !service.IsResponseCommitted(c) {
+				if errors.As(forwardErr, &failoverErr) {
+					h.handleFailoverExhausted(c, failoverErr, false)
+				} else {
+					h.errorResponse(c, http.StatusBadGateway, "upstream_error", "Voice request outcome is unknown; do not automatically retry")
+				}
+			}
+			return
+		}
 		if errors.As(forwardErr, &failoverErr) && failoverErr.ShouldRetryNextAccount() {
 			failed[account.ID] = struct{}{}
 			last = failoverErr

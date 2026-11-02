@@ -66,6 +66,11 @@ func main() {
 		return
 	}
 
+	shutdownTimeout, err := shutdownTimeoutFromEnv()
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	// CLI setup mode
 	if *setupMode {
 		if err := setup.RunCLI(); err != nil {
@@ -91,7 +96,7 @@ func main() {
 	}
 
 	// Normal server mode
-	runMainServer()
+	runMainServer(shutdownTimeout)
 }
 
 func runSetupServer() {
@@ -131,7 +136,7 @@ func runSetupServer() {
 	}
 }
 
-func runMainServer() {
+func runMainServer(shutdownTimeout time.Duration) {
 	cfg, err := config.LoadForBootstrap()
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
@@ -184,12 +189,28 @@ func runMainServer() {
 
 	log.Println("Shutting down server...")
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	if err := app.Server.Shutdown(ctx); err != nil {
+	if err := shutdownHTTPServer(app.Server, shutdownTimeout); err != nil {
 		log.Printf("Server forced to shutdown: %v", err)
 	}
 
 	log.Println("Server exited")
+}
+
+// shutdownTimeoutFromEnv is shared by startup validation and shutdown tests.
+func shutdownTimeoutFromEnv() (time.Duration, error) {
+	timeout := 90 * time.Second
+	if raw := os.Getenv("AI_ROUTER_SHUTDOWN_TIMEOUT"); raw != "" {
+		parsed, err := time.ParseDuration(raw)
+		if err != nil || parsed <= 0 {
+			return 0, errors.New("AI_ROUTER_SHUTDOWN_TIMEOUT must be a positive duration")
+		}
+		timeout = parsed
+	}
+	return timeout, nil
+}
+
+func shutdownHTTPServer(server *http.Server, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return server.Shutdown(ctx)
 }

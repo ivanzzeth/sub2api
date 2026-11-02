@@ -218,9 +218,22 @@ func (s *httpUpstreamService) Do(req *http.Request, proxyURL string, accountID i
 
 	// 执行请求
 	client := s.httpClientForUpstreamRequest(entry.client, req)
-	client = httpClientWithGrokAccessDeniedFallback(client)
+	var closeVoiceIdle func()
+	if req != nil && service.HTTPUpstreamVoiceSingleAttempt(req.Context()) {
+		client, closeVoiceIdle, err = voiceSingleAttemptHTTPClient(client, req)
+		if err != nil {
+			atomic.AddInt64(&entry.inFlight, -1)
+			atomic.StoreInt64(&entry.lastUsed, time.Now().UnixNano())
+			return nil, err
+		}
+	} else {
+		client = httpClientWithGrokAccessDeniedFallback(client)
+	}
 	resp, err := doUpstreamRequest(client, req)
 	if err != nil {
+		if closeVoiceIdle != nil {
+			closeVoiceIdle()
+		}
 		s.recordOpenAIHTTP2Failure(profile, entry.protocolMode, entry.proxyKey, err)
 		// 请求失败，立即减少计数
 		atomic.AddInt64(&entry.inFlight, -1)
@@ -232,6 +245,9 @@ func (s *httpUpstreamService) Do(req *http.Request, proxyURL string, accountID i
 	// 包装响应体，在关闭时自动减少计数并更新时间戳
 	// 这确保了流式响应（如 SSE）在完全读取前不会被淘汰
 	resp.Body = wrapTrackedBody(resp.Body, func() {
+		if closeVoiceIdle != nil {
+			closeVoiceIdle()
+		}
 		atomic.AddInt64(&entry.inFlight, -1)
 		atomic.StoreInt64(&entry.lastUsed, time.Now().UnixNano())
 	})
@@ -369,6 +385,45 @@ func (s *httpUpstreamService) httpClientForUpstreamRequest(client *http.Client, 
 	}
 }
 
+// voiceSingleAttemptHTTPClient owns a fresh HTTP/1-only transport. It preserves
+// native proxy/TLS/dial/timeouts without allowing hidden redirect or H2 replay.
+func voiceSingleAttemptHTTPClient(client *http.Client, req *http.Request) (*http.Client, func(), error) {
+	if client == nil || req == nil {
+		return nil, nil, fmt.Errorf("voice request/client required")
+	}
+	for key := range req.Header {
+		if strings.EqualFold(key, "Idempotency-Key") || strings.EqualFold(key, "X-Idempotency-Key") {
+			return nil, nil, fmt.Errorf("unsafe voice idempotency header rejected")
+		}
+	}
+	transport := client.Transport
+	if transport == nil {
+		transport = http.DefaultTransport
+	}
+	native, ok := transport.(*http.Transport)
+	if !ok || native == nil {
+		return nil, nil, fmt.Errorf("voice single-attempt requires a native HTTP transport")
+	}
+	owned := native.Clone()
+	owned.Protocols = new(http.Protocols)
+	owned.Protocols.SetHTTP1(true)
+	owned.Protocols.SetHTTP2(false)
+	owned.Protocols.SetUnencryptedHTTP2(false)
+	owned.ForceAttemptHTTP2 = false
+	owned.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
+	if owned.TLSClientConfig == nil {
+		owned.TLSClientConfig = &tls.Config{}
+	} else {
+		owned.TLSClientConfig = owned.TLSClientConfig.Clone()
+	}
+	owned.TLSClientConfig.NextProtos = []string{"http/1.1"}
+	clone := *client
+	clone.Transport = owned
+	clone.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	req.GetBody = nil
+	return &clone, owned.CloseIdleConnections, nil
+}
+
 // grokAccessDeniedFallbackTransport preserves the subscription CLI proxy as
 // the primary OAuth route, but retries a replayable request against api.x.ai
 // when the proxy returns its compatibility-specific 403 "Access denied".
@@ -394,7 +449,7 @@ func httpClientWithGrokAccessDeniedFallback(client *http.Client) *http.Client {
 
 func (t *grokAccessDeniedFallbackTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	resp, err := t.base.RoundTrip(req)
-	if err != nil || !isGrokCLIAccessDeniedFallbackCandidate(req, resp) {
+	if err != nil || (req != nil && service.HTTPUpstreamVoiceSingleAttempt(req.Context())) || !isGrokCLIAccessDeniedFallbackCandidate(req, resp) {
 		return resp, err
 	}
 

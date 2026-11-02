@@ -1337,11 +1337,16 @@ func (s *GatewayService) DoGrokNativeResponsesJSON(ctx context.Context, account 
 		return nil, err
 	}
 	if json.Valid(body) {
-		if model := strings.TrimSpace(gjson.GetBytes(body, "model").String()); model == "" {
-			if patched, patchErr := sjson.SetBytes(body, "model", xai.DefaultTextModel); patchErr == nil {
-				body = patched
-			}
+		logicalModel := xai.ResolveDefaultTextModel(gjson.GetBytes(body, "model").String())
+		upstreamModel := strings.TrimSpace(account.GetMappedModel(logicalModel))
+		if upstreamModel == "" {
+			return nil, errors.New("grok responses model mapping is empty")
 		}
+		patched, patchErr := sjson.SetBytes(body, "model", upstreamModel)
+		if patchErr != nil {
+			return nil, fmt.Errorf("set grok responses upstream model: %w", patchErr)
+		}
+		body = patched
 	}
 	upstreamReq, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, bytes.NewReader(body))
 	if err != nil {
