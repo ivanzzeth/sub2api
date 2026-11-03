@@ -122,3 +122,161 @@ func TestGPTImage25UsagePreservesImageInputTokens(t *testing.T) {
 	require.Equal(t, 1521, usage.ImageInputTokens)
 	require.Equal(t, 515, usage.ImageOutputTokens)
 }
+
+const seedreamModelFixture = "doubao-seedream-5pro-synthetic"
+const seedreamProfileFixture = "ark-agent-plan-seedream-5pro-v1"
+
+func seedreamAccountFixture(public, route string) *Account {
+	return &Account{ID: 91, Platform: PlatformOpenAI, Type: AccountTypeAPIKey, Credentials: map[string]any{"api_key": "synthetic-relay", "base_url": "https://example.invalid/v1", "model_mapping": map[string]any{public: route}, "image_profiles": map[string]any{route: seedreamProfileFixture}}}
+}
+func TestSeedreamTrustedFinalMapping(t *testing.T) {
+	route := "source-owned/" + seedreamModelFixture
+	for _, tc := range []struct {
+		name, public, channel, mapped, mapKey, profile, accountType string
+		reject                                                      bool
+	}{
+		{name: "literal", public: seedreamModelFixture, mapped: route},
+		{name: "ordinary_public_account_mapping", public: "gpt-image-1", mapped: route},
+		{name: "ordinary_public_channel_mapping", public: "gpt-image-1", channel: seedreamModelFixture, mapped: route},
+		{name: "wrong_vendor_map_key", public: "gpt-image-1", mapped: route, mapKey: seedreamModelFixture, reject: true},
+		{name: "missing_profile", public: "gpt-image-1", mapped: route, profile: "missing", reject: true},
+		{name: "invalid_profile", public: "gpt-image-1", mapped: route, profile: "untrusted-v99", reject: true},
+		{name: "seedream_mapped_gpt", public: seedreamModelFixture, mapped: "gpt-image-1", reject: true},
+		{name: "oauth_account", public: seedreamModelFixture, mapped: route, accountType: AccountTypeOAuth, reject: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			selected := tc.public
+			if tc.channel != "" {
+				selected = tc.channel
+			}
+			account := seedreamAccountFixture(selected, tc.mapped)
+			if tc.accountType != "" {
+				account.Type = tc.accountType
+			}
+			key := tc.mapped
+			if tc.mapKey != "" {
+				key = tc.mapKey
+			}
+			profile := seedreamProfileFixture
+			if tc.profile != "" {
+				profile = tc.profile
+			}
+			if profile == "missing" {
+				delete(account.Credentials, "image_profiles")
+			} else {
+				account.Credentials["image_profiles"] = map[string]any{key: profile}
+			}
+			raw := []byte(fmt.Sprintf(`{"model":%q,"prompt":"draw","size":"1K","n":1}`, tc.public))
+			c, _ := newOpenAIImagesTestContext(t, raw)
+			svc := &OpenAIGatewayService{}
+			parsed, err := svc.ParseOpenAIImagesRequest(c, raw)
+			require.NoError(t, err)
+			require.Empty(t, parsed.SeedreamProfile, "parser must not grant trust")
+			err = qualifySeedreamImageProfile(account, parsed, tc.channel)
+			if tc.reject {
+				var prewrite *SeedreamImageProfileError
+				require.ErrorAs(t, err, &prewrite)
+				require.Empty(t, parsed.SeedreamProfile)
+			} else {
+				require.NoError(t, err)
+				require.Equal(t, seedreamProfileFixture, parsed.SeedreamProfile)
+				require.Equal(t, "1K", parsed.SizeTier)
+			}
+		})
+	}
+}
+
+func TestSeedreamOriginalJSONRejectsBeforeForward(t *testing.T) {
+	for _, body := range []string{
+		`{"model":"gpt-image-1","prompt":"draw","size":"1K","stream":null}`,
+		`{"model":"gpt-image-1","prompt":"draw","size":"1K","stream":false,"stream":false}`,
+		`{"model":"gpt-image-1","prompt":"draw","size":"1K","str\u0065am":false,"stream":false}`,
+		`{"model":"gpt-image-1","prompt":"draw","size":"1K","size":"2K"}`,
+		`{"model":"gpt-image-1","prompt":"draw","size":"1K","watermark":null}`,
+		`{"model":"gpt-image-1","prompt":"draw","size":"1K","n":1.9}`,
+		`{"model":"gpt-image-1","prompt":"draw","size":"1K","n":1.0}`,
+		`{"model":"gpt-image-1","prompt":"draw","size":"1K","n":null}`,
+		`{"model":"gpt-image-1","prompt":"draw","size":"1K"}{}`,
+	} {
+		t.Run(body, func(t *testing.T) {
+			raw := []byte(body)
+			c, _ := newOpenAIImagesTestContext(t, raw)
+			upstream := &httpUpstreamRecorder{resp: openAIImagesJSONResponse()}
+			svc := newOpenAIImagesTestService(upstream)
+			parsed, err := svc.ParseOpenAIImagesRequest(c, raw)
+			if err == nil {
+				_, err = svc.ForwardImages(context.Background(), c, seedreamAccountFixture("gpt-image-1", "source-owned/"+seedreamModelFixture), raw, parsed, "")
+			}
+			require.Error(t, err)
+			require.Nil(t, upstream.lastReq, "original JSON must be rejected before downstream preparation")
+		})
+	}
+}
+
+func TestSeedreamForwardImageCountSizeAndErrorClose(t *testing.T) {
+	for _, tc := range []struct {
+		name, body string
+		status     int
+		reject     bool
+	}{
+		{"one_1K", `{"data":[{"b64_json":"aGVsbG8=","size":"1024x1024"}]}`, 200, false},
+		{"one_2K", `{"data":[{"b64_json":"aGVsbG8=","size":"2048x2048"}]}`, 200, false},
+		{"no_size", `{"data":[{"b64_json":"aGVsbG8="}]}`, 200, true},
+		{"two_images", `{"data":[{"b64_json":"AA==","size":"1K"},{"b64_json":"AQ==","size":"1K"}]}`, 200, true},
+		{"wrong_size", `{"data":[{"b64_json":"AA==","size":"2K"}]}`, 200, true},
+		{"no_1_5K_guess", `{"data":[{"b64_json":"AA==","size":"1.5K"}]}`, 200, true},
+		{"error_body_closed", `{"error":{"message":"synthetic rejected"}}`, 502, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			size := "1K"
+			if tc.name == "one_2K" {
+				size = "2K"
+			}
+			raw := []byte(fmt.Sprintf(`{"model":"gpt-image-1","prompt":"draw","size":%q,"n":1}`, size))
+			c, _ := newOpenAIImagesTestContext(t, raw)
+			price1K, price2K := 0.20, 0.30
+			group := &Group{ImagePrice1K: &price1K}
+			if size == "2K" {
+				group.ImagePrice2K = &price2K
+			}
+			c.Set("api_key", &APIKey{Group: group})
+			closed := false
+			readCloser := &seedreamTrackingBody{Reader: strings.NewReader(tc.body), closed: &closed}
+			upstream := &httpUpstreamRecorder{resp: &http.Response{StatusCode: tc.status, Header: http.Header{"Content-Type": {"application/json"}}, Body: readCloser}}
+			svc := newOpenAIImagesTestService(upstream)
+			parsed, err := svc.ParseOpenAIImagesRequest(c, raw)
+			require.NoError(t, err)
+			result, err := svc.ForwardImages(context.Background(), c, seedreamAccountFixture("gpt-image-1", "source-owned/"+seedreamModelFixture), raw, parsed, "")
+			require.NotNil(t, upstream.lastReq)
+			require.True(t, HTTPUpstreamImageSingleAttempt(upstream.lastReq.Context()))
+			require.False(t, HTTPUpstreamVoiceSingleAttempt(upstream.lastReq.Context()))
+			require.Equal(t, "source-owned/"+seedreamModelFixture, gjson.GetBytes(upstream.lastBody, "model").String())
+			require.True(t, closed)
+			if tc.reject {
+				require.Error(t, err)
+				require.Nil(t, result)
+			} else {
+				require.NoError(t, err)
+				require.Equal(t, 1, result.ImageCount)
+				require.Equal(t, size, result.ImageSize)
+
+				svc.billingService = &BillingService{}
+				cost := svc.calculateOpenAIImageCost(context.Background(), seedreamModelFixture, getAPIKeyFromContext(c), result, 1)
+				expected := price1K
+				if size == "2K" {
+					expected = price2K
+				}
+				require.InDelta(t, expected, cost.ActualCost, 1e-12)
+				require.Equal(t, string(BillingModeImage), cost.BillingMode)
+				require.Equal(t, "source-owned/"+seedreamModelFixture, result.UpstreamModel)
+			}
+		})
+	}
+}
+
+type seedreamTrackingBody struct {
+	io.Reader
+	closed *bool
+}
+
+func (b *seedreamTrackingBody) Close() error { *b.closed = true; return nil }

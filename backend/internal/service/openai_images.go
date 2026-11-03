@@ -95,6 +95,7 @@ type OpenAIImagesRequest struct {
 	PartialImages      *int
 	HasMask            bool
 	HasNativeOptions   bool
+	SeedreamProfile    string // server-owned selected Account + final mapped route
 	RequiredCapability OpenAIImagesCapability
 	InputImageURLs     []string
 	MaskImageURL       string
@@ -238,6 +239,11 @@ func (s *OpenAIGatewayService) ParseOpenAIImagesRequest(c *gin.Context, body []b
 	}
 	if err := validateCompatibleImagesModel(req.Model); err != nil {
 		return nil, err
+	}
+	if seedreamImageModel(req.Model) {
+		if req.IsEdits() || req.Stream || req.Multipart || req.N != 1 || (req.Size != "1K" && req.Size != "2K") {
+			return nil, fmt.Errorf("Seedream P1 requires synchronous single generation at priced 1K/2K")
+		}
 	}
 	req.SizeTier = normalizeOpenAIImageSizeTier(req.Size)
 	req.RequiredCapability = classifyOpenAIImagesCapability(req)
@@ -512,6 +518,9 @@ func isGeminiCompatibleImageModel(model string) bool {
 }
 
 func validateCompatibleImagesModel(model string) error {
+	if seedreamImageModel(model) {
+		return nil
+	}
 	if isGeminiCompatibleImageModel(model) {
 		return nil
 	}
@@ -521,6 +530,9 @@ func validateCompatibleImagesModel(model string) error {
 // RequiredCapabilityForModel also applies the API-key-only fence when channel
 // mapping introduces a compatible provider model after request parsing.
 func (req *OpenAIImagesRequest) RequiredCapabilityForModel(model string) OpenAIImagesCapability {
+	if seedreamImageModel(model) {
+		return OpenAIImagesCapabilitySeedream
+	}
 	if isGeminiCompatibleImageModel(model) {
 		return OpenAIImagesCapabilityAPIKey
 	}
@@ -542,6 +554,9 @@ func normalizeOpenAIImagesEndpointPath(path string) string {
 func classifyOpenAIImagesCapability(req *OpenAIImagesRequest) OpenAIImagesCapability {
 	if req == nil {
 		return OpenAIImagesCapabilityNative
+	}
+	if seedreamImageModel(req.Model) {
+		return OpenAIImagesCapabilitySeedream
 	}
 	if isGeminiCompatibleImageModel(req.Model) {
 		return OpenAIImagesCapabilityAPIKey
@@ -607,6 +622,12 @@ func (s *OpenAIGatewayService) ForwardImages(
 	if parsed == nil {
 		return nil, fmt.Errorf("parsed images request is required")
 	}
+	if err := qualifySeedreamImageProfile(account, parsed, channelMappedModel); err != nil {
+		return nil, err
+	}
+	if err := qualifySeedreamImagePrice(c, parsed); err != nil {
+		return nil, err
+	}
 	switch account.Type {
 	case AccountTypeAPIKey:
 		return s.forwardOpenAIImagesAPIKey(ctx, c, account, body, parsed, channelMappedModel)
@@ -659,6 +680,9 @@ func (s *OpenAIGatewayService) forwardOpenAIImagesAPIKey(
 	// 图已经生成并计费。同一端点的 OAuth 分支 forwardOpenAIImagesOAuth 以及 Grok 媒体
 	// 路径本来就无条件脱钩，这里对齐；上游侧仍由 ResponseHeaderTimeout 兜底。
 	upstreamCtx, releaseUpstreamCtx := detachUpstreamContext(ctx)
+	if parsed.SeedreamProfile != "" {
+		upstreamCtx = WithHTTPUpstreamImageSingleAttempt(upstreamCtx)
+	}
 	defer releaseUpstreamCtx()
 
 	token, _, err := s.GetAccessToken(upstreamCtx, account)
@@ -692,6 +716,10 @@ func (s *OpenAIGatewayService) forwardOpenAIImagesAPIKey(
 			Message:            safeErr,
 		})
 		return nil, fmt.Errorf("upstream request failed: %s", safeErr)
+	}
+	if parsed.SeedreamProfile != "" && resp.StatusCode >= 400 {
+		defer resp.Body.Close()
+		return s.handleOpenAIImagesErrorResponse(upstreamCtx, resp, c, account, upstreamModel)
 	}
 	if resp.StatusCode >= 400 {
 		respBody := s.readUpstreamErrorBody(resp)
@@ -970,6 +998,11 @@ func (s *OpenAIGatewayService) handleOpenAIImagesNonStreamingResponse(
 	body, err := ReadUpstreamResponseBody(resp.Body, s.cfg, c, openAITooLargeError)
 	if err != nil {
 		return OpenAIUsage{}, 0, nil, err
+	}
+	if parsed.SeedreamProfile != "" {
+		if err := validateSeedreamMetering(body, parsed); err != nil {
+			return OpenAIUsage{}, 0, nil, err
+		}
 	}
 	body = s.backfillOpenAIImagesB64JSON(ctx, account, parsed, body)
 	responseheaders.WriteFilteredHeaders(c.Writer.Header(), resp.Header, s.responseHeaderFilter)

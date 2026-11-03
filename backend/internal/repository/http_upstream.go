@@ -219,7 +219,7 @@ func (s *httpUpstreamService) Do(req *http.Request, proxyURL string, accountID i
 	// 执行请求
 	client := s.httpClientForUpstreamRequest(entry.client, req)
 	var closeVoiceIdle func()
-	if req != nil && service.HTTPUpstreamVoiceSingleAttempt(req.Context()) {
+	if req != nil && (service.HTTPUpstreamVoiceSingleAttempt(req.Context()) || service.HTTPUpstreamImageSingleAttempt(req.Context())) {
 		client, closeVoiceIdle, err = voiceSingleAttemptHTTPClient(client, req)
 		if err != nil {
 			atomic.AddInt64(&entry.inFlight, -1)
@@ -449,7 +449,7 @@ func httpClientWithGrokAccessDeniedFallback(client *http.Client) *http.Client {
 
 func (t *grokAccessDeniedFallbackTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	resp, err := t.base.RoundTrip(req)
-	if err != nil || (req != nil && service.HTTPUpstreamVoiceSingleAttempt(req.Context())) || !isGrokCLIAccessDeniedFallbackCandidate(req, resp) {
+	if err != nil || (req != nil && (service.HTTPUpstreamVoiceSingleAttempt(req.Context()) || service.HTTPUpstreamImageSingleAttempt(req.Context()))) || !isGrokCLIAccessDeniedFallbackCandidate(req, resp) {
 		return resp, err
 	}
 

@@ -2042,6 +2042,8 @@ func (a *Account) SupportsOpenAIImageCapability(capability OpenAIImagesCapabilit
 		return false
 	}
 	switch capability {
+	case OpenAIImagesCapabilitySeedream:
+		return a.hasSeedreamProfile()
 	case OpenAIImagesCapabilityAPIKey:
 		return a.Type == AccountTypeAPIKey
 	case OpenAIImagesCapabilityBasic, OpenAIImagesCapabilityNative:

@@ -85,3 +85,16 @@ func WithHTTPUpstreamVoiceSingleAttempt(ctx context.Context) context.Context {
 func HTTPUpstreamVoiceSingleAttempt(ctx context.Context) bool {
 	return ctx != nil && ctx.Value(httpUpstreamVoiceSingleAttemptContextKey{}) == true
 }
+
+// Image profile marker is set only after trusted account/mapped-model profile validation.
+type httpUpstreamImageSingleAttemptContextKey struct{}
+
+func WithHTTPUpstreamImageSingleAttempt(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, httpUpstreamImageSingleAttemptContextKey{}, true)
+}
+func HTTPUpstreamImageSingleAttempt(ctx context.Context) bool {
+	return ctx != nil && ctx.Value(httpUpstreamImageSingleAttemptContextKey{}) == true
+}

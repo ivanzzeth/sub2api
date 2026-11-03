@@ -280,6 +280,16 @@ func (h *OpenAIGatewayHandler) Images(c *gin.Context) {
 					zap.Error(err),
 				)
 			} else {
+				var priceErr *service.SeedreamImagePriceError
+				if errors.As(err, &priceErr) {
+					h.handleStreamingAwareErrorWithCode(c, 400, "invalid_request_error", "image_pricing_required", priceErr.Error(), streamStarted, false)
+					return
+				}
+				var profileErr *service.SeedreamImageProfileError
+				if errors.As(err, &profileErr) {
+					h.handleStreamingAwareErrorWithCode(c, 400, "invalid_request_error", "image_profile_required", profileErr.Error(), streamStarted, false)
+					return
+				}
 				var imageUpstreamErr *service.OpenAIImagesUpstreamError
 				if errors.As(err, &imageUpstreamErr) {
 					retryableServerError := service.IsOpenAIImagesRetryableUpstreamError(imageUpstreamErr)
@@ -299,6 +309,11 @@ func (h *OpenAIGatewayHandler) Images(c *gin.Context) {
 						zap.String("error_code", imageUpstreamErr.Code),
 						zap.Error(err),
 					)
+					return
+				}
+				if parsed.SeedreamProfile != "" {
+					// Any unverified profiled result stops this logical write. Never switch accounts.
+					h.handleStreamingAwareErrorWithCode(c, 502, "upstream_error", "image_generation_outcome_unknown", "Image result is not verified; do not resubmit", streamStarted, false)
 					return
 				}
 				var failoverErr *service.UpstreamFailoverError
