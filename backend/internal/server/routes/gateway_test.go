@@ -466,3 +466,16 @@ func TestGatewayRoutesOpenAICountTokensPathIsRegistered(t *testing.T) {
 	router.ServeHTTP(w, req)
 	require.NotEqual(t, http.StatusNotFound, w.Code)
 }
+
+func TestStandardSpeechRouteDoesNotUseGrokDispatcher(t *testing.T) {
+	for _, platform := range []string{service.PlatformGrok, service.PlatformAnthropic} {
+		router := newGatewayRoutesTestRouter(platform)
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("POST", "/v1/audio/speech", strings.NewReader(`{"model":"doubao-seed-tts-2.0","input":"test"}`))
+		req.Header.Set("Content-Type", "application/json")
+		router.ServeHTTP(rec, req)
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("platform %s status %d", platform, rec.Code)
+		}
+	}
+}

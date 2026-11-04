@@ -6,9 +6,12 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/gin-gonic/gin"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -236,4 +239,108 @@ func TestForwardGrokVoiceGETTerminalRedirectNoSourceB(t *testing.T) {
 			})
 		}
 	}
+}
+
+type speechPriceGroupRepo struct {
+	GroupRepository
+	group *Group
+}
+
+func (r speechPriceGroupRepo) GetByIDLite(context.Context, int64) (*Group, error) {
+	return r.group, nil
+}
+
+type speechHTTPUpstreamFixture struct {
+	HTTPUpstream
+	client *http.Client
+	target string
+	t      *testing.T
+}
+
+func (u speechHTTPUpstreamFixture) Do(req *http.Request, _ string, _ int64, _ int) (*http.Response, error) {
+	if !HTTPUpstreamRedirectsDisabled(req.Context()) || !HTTPUpstreamVoiceSingleAttempt(req.Context()) || req.GetBody != nil {
+		u.t.Error("speech lost fresh/no-replay transport contract")
+	}
+	copy := req.Clone(req.Context())
+	target, _ := url.Parse(u.target)
+	target.Path = req.URL.Path
+	copy.URL = target
+	copy.Host = ""
+	return u.client.Do(copy)
+}
+
+func TestStandardSpeechActualNativeFeeAndSafeResponseBoundary(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		price      *float64
+		perRequest bool
+		words      string
+		ok         bool
+	}{
+		{"normal", speechPricePointer(30), false, "7", true}, {"zero-usage", speechPricePointer(30), false, "0", true},
+		{"nil", nil, false, "7", false}, {"free", speechPricePointer(0), false, "7", false}, {"negative", speechPricePointer(-1), false, "7", false}, {"nan", speechPricePointer(math.NaN()), false, "7", false}, {"infinity", speechPricePointer(math.Inf(1)), false, "7", false}, {"effective-per-request", speechPricePointer(30), true, "7", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var wires atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				wires.Add(1)
+				if r.URL.Path != "/v1/audio/speech" {
+					t.Error("wrong internal route")
+				}
+				w.Header().Set("Content-Type", "audio/mpeg")
+				w.Header().Set(speechPrivateCountHeader, tc.words)
+				w.Header().Set("Set-Cookie", "never")
+				w.Header().Set("X-Supplier-Secret", "never")
+				_, _ = io.WriteString(w, "ID3\x04\x00\x00\x00\x00\x00\x00")
+			}))
+			defer srv.Close()
+			gid := int64(41)
+			group := &Group{ID: gid, Platform: PlatformOpenAI, AudioTTSPricePerMillionChars: tc.price, RateMultiplier: 1}
+			ch := &ChannelService{groupRepo: speechPriceGroupRepo{group: group}}
+			rows := []ChannelModelPricing{}
+			if tc.perRequest {
+				rows = append(rows, ChannelModelPricing{Models: []string{"doubao-seed-tts-2.0"}, Platform: PlatformOpenAI, BillingMode: BillingModePerRequest})
+			}
+			ch.cache.Store(populateChannelCache([]Channel{{ID: 1, Status: StatusActive, GroupIDs: []int64{gid}, ModelPricing: rows}}, map[int64]string{gid: PlatformOpenAI}))
+			cfg := &config.Config{}
+			svc := &OpenAIGatewayService{cfg: cfg, channelService: ch, resolver: NewModelPricingResolver(ch, &BillingService{}), httpUpstream: speechHTTPUpstreamFixture{client: srv.Client(), target: srv.URL, t: t}}
+			key := &APIKey{ID: 5, GroupID: &gid, Group: group, User: &User{ID: 8}}
+			account := &Account{ID: 9, Platform: PlatformOpenAI, Type: AccountTypeAPIKey, Credentials: map[string]any{"api_key": "fixture-proxy-client", "base_url": "https://proxy.fixture.invalid/v1", "model_mapping": map[string]any{"doubao-seed-tts-2.0": "source-A/doubao-seed-tts-2.0"}, "speech_profiles": map[string]any{"source-A/doubao-seed-tts-2.0": speechProfileV1}, "upstream_protocols": map[string]any{"source-A/doubao-seed-tts-2.0": string(speechProtocolVolcengineTTS)}}}
+			parsed, err := ParseOpenAISpeechRequest([]byte(`{"model":"doubao-seed-tts-2.0","input":"你好，hello!"}`))
+			require.NoError(t, err)
+			rec := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(rec)
+			c.Request = httptest.NewRequest("POST", "/v1/audio/speech", nil)
+			result, billingKey, err := svc.ForwardOpenAISpeech(context.Background(), c, key, account, parsed, parsed.Model)
+			if !tc.ok {
+				require.Error(t, err)
+				require.Zero(t, wires.Load())
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, int32(1), wires.Load())
+			require.Equal(t, tc.words, rec.Header().Get(speechPublicCountHeader))
+			require.Empty(t, rec.Header().Get(speechPrivateCountHeader))
+			require.Empty(t, rec.Header().Get("Set-Cookie"))
+			require.Empty(t, rec.Header().Get("X-Supplier-Secret"))
+			require.Equal(t, "10", rec.Header().Get("Content-Length"))
+			require.Zero(t, result.Usage.InputTokens)
+			words, _ := strconv.ParseFloat(tc.words, 64)
+			require.Equal(t, words/1e6, result.AudioUsage.DurationOrUnits)
+			cost := (&BillingService{}).CalculateAudioCost("tts", result.AudioUsage.DurationOrUnits, groupAudioPriceConfigFromAPIKey(billingKey), 0.5)
+			require.InDelta(t, words/1e6*30*0.5, cost.ActualCost, 1e-12)
+		})
+	}
+}
+func speechPricePointer(v float64) *float64 { return &v }
+
+func TestStandardSpeechProfileAndNumericInputReject(t *testing.T) {
+	for _, extra := range []string{`,"speed":"1"`, `,"speed":null`, `,"voice":null`, `,"input":"duplicate"`} {
+		_, err := ParseOpenAISpeechRequest([]byte(`{"model":"doubao-seed-tts-2.0","input":"hi"` + extra + `}`))
+		require.Error(t, err)
+	}
+	a := &Account{Credentials: map[string]any{"speech_profiles": map[string]any{"source-A/doubao-seed-tts-2.0": speechProfileV1}, "upstream_protocols": map[string]any{"source-A/doubao-seed-tts-2.0": string(speechProtocolVolcengineTTS)}}}
+	require.Equal(t, speechProfileV1, speechAccountProfile(a, "source-A/doubao-seed-tts-2.0"))
+	require.Empty(t, speechAccountProfile(a, "source-B/doubao-seed-tts-2.0"))
+	require.Empty(t, speechAccountProfile(a, "doubao-seed-tts-2.0"))
 }

@@ -4,6 +4,7 @@ package handler
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -145,4 +146,27 @@ func TestGrokVoiceWrongGroupRejectedBeforeWire(t *testing.T) {
 	h.GrokVoice(c, "tts")
 	require.Equal(t, 404, rec.Code)
 	require.Zero(t, wires.Load())
+}
+
+func TestStandardSpeechValidationDoesNotExecuteAnyProvider(t *testing.T) {
+	for _, extra := range []string{`,"speed":"1"`, `,"speed":null`, `,"voice":"alloy"`, `,"instructions":"read faster"`, `,"url":"https://example.invalid"`} {
+		h, _, _, upstream := newGrokMediaSlotHandler(t, false, false, service.PlatformOpenAI)
+		var wires atomic.Int32
+		upstream.call = func(*http.Request, int64) (*http.Response, error) {
+			wires.Add(1)
+			return nil, fmt.Errorf("must not reach provider")
+		}
+		c, rec := grokMediaSlotContext(context.Background(), true)
+		key, ok := middleware2.GetAPIKeyFromContext(c)
+		if !ok {
+			t.Fatal("missing test key")
+		}
+		key.Group.Platform = service.PlatformOpenAI
+		c.Request = httptest.NewRequest("POST", "/v1/audio/speech", strings.NewReader(`{"model":"doubao-seed-tts-2.0","input":"hello"`+extra+`}`))
+		c.Request.Header.Set("Content-Type", "application/json")
+		h.AudioSpeech(c)
+		if rec.Code != 400 || wires.Load() != 0 {
+			t.Fatalf("status=%d supplier=%d", rec.Code, wires.Load())
+		}
+	}
 }

@@ -88,9 +88,17 @@ func selectResponsesProbeModel(account *Account) string {
 		if upstream == "" || strings.Contains(upstream, "*") {
 			continue
 		}
+		if protocol := accountUpstreamProtocol(account, upstream); protocol != "" && protocol != speechProtocolVolcengineArkText {
+			continue
+		}
 		candidates = append(candidates, upstream)
 	}
 	if len(candidates) == 0 {
+		for _, upstream := range mapping {
+			if protocol := accountUpstreamProtocol(account, upstream); protocol != "" && protocol != speechProtocolVolcengineArkText {
+				return ""
+			}
+		}
 		return openai.DefaultTestModel
 	}
 	sort.Strings(candidates)
@@ -171,6 +179,9 @@ func (s *AccountTestService) ProbeOpenAIAPIKeyResponsesSupport(ctx context.Conte
 
 	probeURL := buildOpenAIResponsesURL(normalizedBaseURL)
 	probeModel := selectResponsesProbeModel(account)
+	if probeModel == "" {
+		return
+	}
 
 	probeCtx, cancel := context.WithTimeout(ctx, openaiResponsesProbeTimeout)
 	defer cancel()

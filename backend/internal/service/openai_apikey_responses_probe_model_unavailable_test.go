@@ -47,3 +47,13 @@ func TestSelectResponsesProbeModelPrefersGeneralTextModel(t *testing.T) {
 	}}}
 	require.Equal(t, "gpt-5.5", selectResponsesProbeModel(account))
 }
+
+func TestResponsesProbeSkipsTrustedAudioOnlyMappings(t *testing.T) {
+	a := &Account{Credentials: map[string]any{"model_mapping": map[string]any{"doubao-seed-tts-2.0": "source-A/doubao-seed-tts-2.0"}, "speech_profiles": map[string]any{"source-A/doubao-seed-tts-2.0": speechProfileV1}, "upstream_protocols": map[string]any{"source-A/doubao-seed-tts-2.0": string(speechProtocolVolcengineTTS)}}}
+	require.Empty(t, selectResponsesProbeModel(a))
+	a.Credentials["model_mapping"].(map[string]any)["gpt-5.5"] = "gpt-5.5"
+	require.Equal(t, "gpt-5.5", selectResponsesProbeModel(a))
+	delete(a.Credentials["upstream_protocols"].(map[string]any), "source-A/doubao-seed-tts-2.0")
+	delete(a.Credentials["model_mapping"].(map[string]any), "gpt-5.5")
+	require.Equal(t, "source-A/doubao-seed-tts-2.0", selectResponsesProbeModel(a))
+}
