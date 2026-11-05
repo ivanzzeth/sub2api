@@ -977,3 +977,27 @@ func (h *UserHandler) ResetUserPlatformQuotaWindow(c *gin.Context) {
 	}
 	response.Success(c, map[string]any{"platform_quotas": out})
 }
+
+// SetGroupGrant uses the existing admin JWT authorization and user grant store.
+func (h *UserHandler) SetGroupGrant(c *gin.Context) {
+	userID, userErr := strconv.ParseInt(c.Param("id"), 10, 64)
+	groupID, groupErr := strconv.ParseInt(c.Param("group_id"), 10, 64)
+	if userErr != nil || groupErr != nil || userID <= 0 || groupID <= 0 {
+		response.BadRequest(c, "Invalid user or group ID")
+		return
+	}
+	group, err := h.adminService.GetGroup(c.Request.Context(), groupID)
+	if err != nil {
+		response.ErrorFrom(c, err)
+		return
+	}
+	if group == nil || group.SubscriptionType != service.SubscriptionTypeStandard {
+		response.BadRequest(c, "Incremental grant requires a standard group")
+		return
+	}
+	if err = h.userService.SetAllowedGroup(c.Request.Context(), userID, groupID, c.Request.Method == "PUT"); err != nil {
+		response.ErrorFrom(c, err)
+		return
+	}
+	response.Success(c, gin.H{"group_id": groupID, "granted": c.Request.Method == "PUT"})
+}

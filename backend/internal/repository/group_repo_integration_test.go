@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1304,4 +1305,78 @@ func (s *GroupRepoSuite) TestDelete_SoftDeletedGroup_lockForUpdate() {
 	_, err = s.repo.GetByID(s.ctx, group.ID)
 	s.Require().Error(err, "should fail to get soft-deleted group")
 	s.Require().ErrorIs(err, service.ErrGroupNotFound)
+}
+
+// Real PostgreSQL, no in-memory comparison masquerading as CAS.
+func TestGroupConditionalUpdateAtomic(t *testing.T) {
+	ctx := context.Background()
+	client := testEntClient(t)
+	repo := newGroupRepositoryWithSQL(client, integrationDB)
+	g := &service.Group{Name: "cas-group", Platform: service.PlatformOpenAI, RateMultiplier: 1, Status: service.StatusActive, SubscriptionType: service.SubscriptionTypeStandard}
+	require.NoError(t, repo.Create(ctx, g))
+	t.Cleanup(func() { _, _ = integrationDB.ExecContext(ctx, "DELETE FROM groups WHERE id=$1", g.ID) })
+	foreignInput, foreignOutput := 0.25, 0.75
+	g.ModelPricing = []service.ChannelModelPricing{{Platform: service.PlatformOpenAI, Models: []string{"foreign-model"}, BillingMode: service.BillingModeToken, InputPrice: &foreignInput, OutputPrice: &foreignOutput}}
+	require.NoError(t, repo.Update(ctx, g))
+	original := g.UpdatedAt
+	g.Name = "matching"
+	g.ExpectedUpdatedAt = &original
+	require.NoError(t, repo.Update(ctx, g))
+	require.True(t, g.UpdatedAt.After(original))
+	stale, err := repo.GetByID(ctx, g.ID)
+	require.NoError(t, err)
+	stale.Name = "must-not-overwrite"
+	stale.ExpectedUpdatedAt = &original
+	require.ErrorIs(t, repo.Update(ctx, stale), service.ErrGroupUpdateConflict)
+	stored, err := repo.GetByID(ctx, g.ID)
+	require.NoError(t, err)
+	require.Equal(t, "matching", stored.Name)
+	require.Equal(t, g.ModelPricing, stored.ModelPricing)
+	// Two real connections use the same observed version; exactly one UPDATE matches.
+	one, err := repo.GetByID(ctx, g.ID)
+	require.NoError(t, err)
+	two, err := repo.GetByID(ctx, g.ID)
+	require.NoError(t, err)
+	version := one.UpdatedAt
+	one.ExpectedUpdatedAt = &version
+	two.ExpectedUpdatedAt = &version
+	one.Description = "writer-one"
+	two.Description = "writer-two"
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	var wg sync.WaitGroup
+	for _, candidate := range []*service.Group{one, two} {
+		wg.Add(1)
+		go func(x *service.Group) { defer wg.Done(); <-start; results <- repo.Update(ctx, x) }(candidate)
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+	ok, conflicts := 0, 0
+	for e := range results {
+		if e == nil {
+			ok++
+		} else {
+			require.ErrorIs(t, e, service.ErrGroupUpdateConflict)
+			conflicts++
+		}
+	}
+	require.Equal(t, 1, ok)
+	require.Equal(t, 1, conflicts)
+	legacy, err := repo.GetByID(ctx, g.ID)
+	require.NoError(t, err)
+	legacy.Name = "legacy-no-condition"
+	require.NoError(t, repo.Update(ctx, legacy))
+	missing := *legacy
+	missing.ID = -1
+	require.ErrorIs(t, repo.Update(ctx, &missing), service.ErrGroupNotFound)
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+	legacy.Name = "must-not-write-db-error"
+	err = repo.Update(canceled, legacy)
+	require.Error(t, err)
+	require.False(t, errors.Is(err, service.ErrGroupUpdateConflict))
+	last, err := repo.GetByID(ctx, g.ID)
+	require.NoError(t, err)
+	require.Equal(t, "legacy-no-condition", last.Name)
 }

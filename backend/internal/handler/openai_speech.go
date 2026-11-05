@@ -12,8 +12,8 @@ import (
 
 func (h *OpenAIGatewayHandler) AudioSpeech(c *gin.Context) {
 	apiKey, ok := middleware2.GetAPIKeyFromContext(c)
-	if !ok || apiKey == nil || apiKey.Group == nil || apiKey.Group.Platform != service.PlatformOpenAI {
-		h.errorResponse(c, 404, "not_found_error", "Speech requires the original OpenAI group")
+	if !ok || apiKey == nil || apiKey.Group == nil || (apiKey.Group.Platform != service.PlatformOpenAI && apiKey.Group.Platform != service.PlatformGrok) {
+		h.errorResponse(c, 404, "not_found_error", "Speech requires an authorized native group and supported model")
 		return
 	}
 	if !h.ensureResponsesDependencies(c, nil) {
@@ -75,8 +75,8 @@ func (h *OpenAIGatewayHandler) AudioSpeech(c *gin.Context) {
 		return
 	}
 	defer inflightDone()
-	selection, _, err := h.gatewayService.SelectAccountWithSchedulerForCapability(c.Request.Context(), apiKey.GroupID, "", "", channelModel, map[int64]struct{}{}, service.OpenAIUpstreamTransportHTTPSSE, "", false, false, false, service.PlatformOpenAI)
-	if err != nil || selection == nil || selection.Account == nil {
+	selection, _, err := h.gatewayService.SelectAccountWithSchedulerForCapability(c.Request.Context(), apiKey.GroupID, "", "", channelModel, map[int64]struct{}{}, service.OpenAIUpstreamTransportHTTPSSE, "", false, false, false, apiKey.Group.Platform)
+	if err != nil || selection == nil || selection.Account == nil || !service.SpeechAccountBelongsToGroup(apiKey, selection.Account) {
 		h.errorResponse(c, 503, "api_error", "No available speech account")
 		return
 	}

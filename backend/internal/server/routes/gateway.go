@@ -286,7 +286,7 @@ func RegisterGatewayRoutes(
 		// Not part of the creation-center product surface — gateway relay only.
 		voiceHandler := func(endpoint string) gin.HandlerFunc {
 			return func(c *gin.Context) {
-				if getGroupPlatform(c) != service.PlatformGrok {
+				if getGroupPlatform(c) != service.PlatformGrok && !(endpoint == "tts" && getGroupPlatform(c) == service.PlatformOpenAI) {
 					service.MarkOpsClientBusinessLimited(c, service.OpsClientBusinessLimitedReasonLocalFeatureGate)
 					c.JSON(http.StatusNotFound, gin.H{"error": gin.H{"type": "not_found_error", "message": "Voice API is not supported for this platform"}})
 					return

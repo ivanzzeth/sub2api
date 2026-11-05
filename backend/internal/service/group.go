@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"math"
@@ -8,6 +9,7 @@ import (
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/domain"
+	infraerrors "github.com/Wei-Shaw/sub2api/internal/pkg/errors"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/timezone"
 )
 
@@ -15,13 +17,17 @@ type OpenAIMessagesDispatchModelConfig = domain.OpenAIMessagesDispatchModelConfi
 type GroupCodexModelsManifestConfig = domain.GroupCodexModelsManifestConfig
 type ReasoningEffortMapping = domain.ReasoningEffortMapping
 
+var ErrGroupUpdateConflict = infraerrors.Conflict("GROUP_UPDATE_CONFLICT", "group changed; reload before updating")
+
 type Group struct {
-	ID             int64
-	Name           string
-	Description    string
-	I18n           GroupI18n // 名称与描述的界面语言译文；缺失的语言沿用 Name/Description
-	Platform       string
-	RateMultiplier float64
+	// Transient single-write precondition; not persisted or exposed as group data.
+	ExpectedUpdatedAt *time.Time `json:"-"`
+	ID                int64
+	Name              string
+	Description       string
+	I18n              GroupI18n // 名称与描述的界面语言译文；缺失的语言沿用 Name/Description
+	Platform          string
+	RateMultiplier    float64
 	// 高峰时段倍率：peak_rate_enabled 为 true 且当前时刻处于 [PeakStart, PeakEnd) 时，
 	// token 计费倍率额外乘以 PeakRateMultiplier。详见 PeakMultiplierAt。
 	PeakRateEnabled    bool
@@ -476,4 +482,25 @@ func (g *Group) GetSearchPricePer1k() *float64 {
 		return nil
 	}
 	return g.SearchPricePer1k
+}
+
+// Private scope is created only by authenticated Sub middleware, never HTTP headers.
+type privateGroupScopeKey struct{}
+
+var ErrPrivateGroupScope = errors.New("private group routing scope violation")
+
+func (g *Group) IsPrivateStandard() bool {
+	return g != nil && g.IsExclusive && g.SubscriptionType == "standard"
+}
+
+func WithPrivateGroupScope(ctx context.Context, group *Group) context.Context {
+	if !group.IsPrivateStandard() {
+		return ctx
+	}
+	return context.WithValue(ctx, privateGroupScopeKey{}, group.ID)
+}
+
+func PrivateGroupScopeAllows(ctx context.Context, groupID *int64) bool {
+	original, locked := ctx.Value(privateGroupScopeKey{}).(int64)
+	return !locked || groupID != nil && *groupID == original
 }

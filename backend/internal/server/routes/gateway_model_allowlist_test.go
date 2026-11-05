@@ -146,6 +146,7 @@ func TestGatewayRoutesGroupModelAllowlistCoversRootAliasRoutes(t *testing.T) {
 		{http.MethodPost, "/images/edits", `{"model":"gpt-4.1"}`},
 		{http.MethodPost, "/videos/generations", `{"model":"gpt-4.1"}`},
 		{http.MethodPost, "/messages/count_tokens", `{"model":"gpt-4.1","messages":[]}`},
+		{http.MethodPost, "/v1/audio/speech", `{"model":"gpt-4.1","input":"hello","voice":"eve"}`},
 		{http.MethodPost, "/tts", `{"model":"gpt-4.1"}`},
 		{http.MethodPost, "/stt", `{"model":"gpt-4.1"}`},
 		{http.MethodPost, "/alpha/search", `{"model":"gpt-4.1"}`},
@@ -209,5 +210,60 @@ func TestGatewayRoutesGroupModelAllowlistModelFreeRoutesUnaffected(t *testing.T)
 		router.ServeHTTP(w, req)
 		require.NotContains(t, w.Body.String(), "not available for this group",
 			"%s should not be blocked by the allowlist middleware, got: %s", path, w.Body.String())
+	}
+}
+
+func TestSpeechCompatibleEntryKeepsNativeGroupModelAdmission(t *testing.T) {
+	for _, platform := range []string{service.PlatformOpenAI, service.PlatformGrok} {
+		t.Run(platform, func(t *testing.T) {
+			group := allowlistGroup(platform, true, "authorized-speech")
+			router := newGatewayRoutesTestRouterWithGroup(group)
+			request := httptest.NewRequest(http.MethodPost, "/v1/audio/speech", strings.NewReader(`{"model":"not-authorized","input":"hello","voice":"eve"}`))
+			request.Header.Set("Content-Type", "application/json")
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, request)
+			require.Equal(t, http.StatusNotFound, response.Code)
+			require.Contains(t, response.Body.String(), "not available for this group")
+		})
+	}
+}
+
+func TestSpeechAuthorizedAliasReachesSameGroupHandlerWithoutNameGuess(t *testing.T) {
+	for _, platform := range []string{service.PlatformOpenAI, service.PlatformGrok} {
+		for _, path := range []string{"/v1/audio/speech"} {
+			t.Run(platform+path, func(t *testing.T) {
+				router := newGatewayRoutesTestRouterWithGroup(allowlistGroup(platform, true, "authorized-speech"))
+				req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{"model":"authorized-speech","input":"hello","voice":"eve"}`))
+				req.Header.Set("Content-Type", "application/json")
+				w := httptest.NewRecorder()
+				router.ServeHTTP(w, req)
+				// The existing empty test handler fails its dependencies after admission.
+				// This is route/Group allowlist coverage, not a synthesis success assertion.
+				require.Equal(t, http.StatusServiceUnavailable, w.Code)
+				require.Contains(t, w.Body.String(), "Service temporarily unavailable")
+				require.NotContains(t, w.Body.String(), "not available for this group")
+			})
+		}
+	}
+}
+
+func TestNativeTTSCompatibleEntryKeepsGroupAndNonTTSBoundaries(t *testing.T) {
+	for _, platform := range []string{service.PlatformOpenAI, service.PlatformGrok, service.PlatformAnthropic} {
+		for _, endpoint := range []string{"tts", "stt", "custom-voices"} {
+			t.Run(platform+"/"+endpoint, func(t *testing.T) {
+				router := newGatewayRoutesTestRouterWithGroup(allowlistGroup(platform, true, "customer-speech"))
+				req := httptest.NewRequest(http.MethodPost, "/v1/"+endpoint, strings.NewReader(`{"text":"hello","voice_id":"eve","language":"auto"}`))
+				req.Header.Set("Content-Type", "application/json")
+				w := httptest.NewRecorder()
+				router.ServeHTTP(w, req)
+				if platform == service.PlatformGrok || platform == service.PlatformOpenAI && endpoint == "tts" {
+					require.Equal(t, 503, w.Code)
+					require.Contains(t, w.Body.String(), "Service temporarily unavailable")
+				} else {
+					require.Equal(t, 404, w.Code)
+					require.Contains(t, w.Body.String(), "Voice API is not supported for this platform")
+				}
+			})
+		}
 	}
 }

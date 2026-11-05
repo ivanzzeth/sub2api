@@ -44,10 +44,54 @@ func GrokVoiceRequestAttempted(err error) bool {
 // The response is intentionally passed through because TTS returns audio bytes
 // while STT returns JSON and xAI may add format-specific headers.
 func (s *OpenAIGatewayService) ForwardGrokVoice(ctx context.Context, c *gin.Context, account *Account, endpoint string, body []byte, contentType string) (*OpenAIForwardResult, error) {
+	return s.forwardGrokVoice(ctx, c, account, endpoint, body, contentType, "")
+}
+
+// ForwardGrokTTSForKey keeps model-less input in the original authorized Group.
+// Only the explicit xAI profile may use an OpenAI account to reach its pinned Proxy.
+func (s *OpenAIGatewayService) ForwardGrokTTSForKey(ctx context.Context, c *gin.Context, key *APIKey, selected *Account, selectionModel string, body []byte, contentType string) (*OpenAIForwardResult, *Account, error) {
+	if s == nil || key == nil || key.Group == nil || selected == nil || selected.ID <= 0 || (key.Group.Platform != PlatformOpenAI && key.Group.Platform != PlatformGrok) {
+		return nil, nil, speechReject("speech_account_scope_required")
+	}
+	resolved, _, qualified, err := s.resolveGrokTTSAccounts(ctx, key)
+	if err != nil {
+		return nil, nil, speechReject("speech_profile_unavailable")
+	}
+	// Absence from an exclusion set proves nothing. The selected ID must be
+	// positively present in this request's current full-qualified candidate set.
+	account, exists := qualified[selected.ID]
+	if !exists || account == nil || resolved != selectionModel {
+		return nil, nil, speechReject("speech_operation_profile_required")
+	}
+	// Use this full object for protocol, credentials, URL, pin and native usage;
+	// never reuse the stale scheduler argument except for its selected ID.
+	if account.Platform == PlatformGrok {
+		result, forwardErr := s.ForwardGrokVoice(ctx, c, account, "tts", body, contentType)
+		return result, account, forwardErr
+	}
+	pin, pinPresent := account.HeaderOverrideValue("x-cliproxy-auth-id")
+	pin = strings.TrimSpace(pin)
+	if !pinPresent || pin == "" || strings.ContainsAny(pin, ",\r\n") {
+		return nil, nil, speechReject("speech_proxy_pin_required")
+	}
+	base, err := s.validateUpstreamBaseURL(account.GetOpenAIBaseURL())
+	if err != nil {
+		return nil, nil, speechReject("speech_proxy_origin_invalid")
+	}
+	target, err := url.Parse(base)
+	if err != nil || strings.EqualFold(target.Hostname(), "api.x.ai") || isGrokCLIProxyTarget(base) {
+		return nil, nil, speechReject("speech_proxy_origin_required")
+	}
+	proxyURL := strings.TrimSuffix(buildOpenAIResponsesURL(base), "/responses") + "/tts"
+	result, forwardErr := s.forwardGrokVoice(ctx, c, account, "tts", body, contentType, proxyURL)
+	return result, account, forwardErr
+}
+
+func (s *OpenAIGatewayService) forwardGrokVoice(ctx context.Context, c *gin.Context, account *Account, endpoint string, body []byte, contentType string, proxyTTSURL string) (*OpenAIForwardResult, error) {
 	if s == nil || account == nil {
 		return nil, fmt.Errorf("grok voice service/account is required")
 	}
-	if account.Platform != PlatformGrok {
+	if account.Platform != PlatformGrok && !(account.Platform == PlatformOpenAI && endpoint == "tts" && proxyTTSURL != "") {
 		return nil, fmt.Errorf("account platform %s is not supported for grok voice", account.Platform)
 	}
 	endpoint = strings.Trim(strings.TrimSpace(endpoint), "/")
@@ -73,9 +117,12 @@ func (s *OpenAIGatewayService) ForwardGrokVoice(ctx context.Context, c *gin.Cont
 	if err != nil {
 		return nil, err
 	}
-	targetURL, err := buildGrokVoiceURL(account, s.cfg, endpoint)
-	if err != nil {
-		return nil, err
+	targetURL := proxyTTSURL
+	if targetURL == "" {
+		targetURL, err = buildGrokVoiceURL(account, s.cfg, endpoint)
+		if err != nil {
+			return nil, err
+		}
 	}
 	upstreamCtx, release := detachUpstreamContext(ctx)
 	defer release()
@@ -465,4 +512,72 @@ func estimateGrokVoiceAudioUsage(endpoint string, reqBody []byte, contentType st
 	default:
 		return nil
 	}
+}
+
+// ResolveGrokTTSSelectionModel derives the existing model-less operation's identity
+// from this Group's actual authorized public aliases and exact Account mappings.
+// It does not choose a default model or create an entitlement.
+func (s *OpenAIGatewayService) ResolveGrokTTSSelectionModel(ctx context.Context, key *APIKey) (string, map[int64]struct{}, error) {
+	model, excluded, _, err := s.resolveGrokTTSAccounts(ctx, key)
+	return model, excluded, err
+}
+
+// resolveGrokTTSAccounts is a request-local proof, not another scheduler/cache.
+func (s *OpenAIGatewayService) resolveGrokTTSAccounts(ctx context.Context, key *APIKey) (string, map[int64]struct{}, map[int64]*Account, error) {
+	excluded := map[int64]struct{}{}
+	qualified := map[int64]*Account{}
+	if s == nil || key == nil || key.GroupID == nil || key.Group == nil || (key.Group.Platform != PlatformGrok && key.Group.Platform != PlatformOpenAI) {
+		return "", excluded, nil, speechReject("speech_group_required")
+	}
+	accounts, err := s.listSchedulableAccounts(ctx, key.GroupID, key.Group.Platform)
+	if err != nil {
+		return "", excluded, nil, err
+	}
+	identities := map[string]string{}
+	for i := range accounts {
+		candidate := &accounts[i]
+		excluded[candidate.ID] = struct{}{}
+		// Candidate metadata intentionally omits protocol/profile fields. Use the
+		// existing full-account hydration before treating them as admission evidence.
+		a, hydrateErr := s.hydrateSelectedAccount(ctx, candidate)
+		if hydrateErr != nil {
+			return "", excluded, nil, speechReject("speech_profile_full_account_unavailable")
+		}
+		if a == nil || a.ID <= 0 || a.ID != candidate.ID || a.Platform != key.Group.Platform || a.Type != AccountTypeAPIKey || !a.IsSchedulable() || !SpeechAccountBelongsToGroup(key, a) {
+			continue
+		}
+		for alias := range a.GetModelMapping() {
+			if alias == "" || strings.ContainsAny(alias, "*?") {
+				continue
+			}
+			if key.Group.ModelAllowlistEnabled() && !key.Group.ModelAllowlist.Allows(alias) {
+				continue
+			}
+			mapping, restricted := s.ResolveChannelMappingAndRestrict(ctx, key.GroupID, alias)
+			if restricted {
+				continue
+			}
+			channelModel := alias
+			if mapping.Mapped {
+				channelModel = mapping.MappedModel
+			}
+			final := a.GetMappedModel(channelModel)
+			if accountUpstreamProtocol(a, final) != speechProtocolXAI || speechAccountProfile(a, final) != speechProfileXAI {
+				continue
+			}
+			// Public aliases are authorization identities. If existing native mappings
+			// cannot prove a single one, model-less input cannot select between them.
+			identity := alias + "\x00" + channelModel + "\x00" + speechProfileXAI + "\x00tts"
+			identities[identity] = channelModel
+			delete(excluded, a.ID)
+			qualified[a.ID] = a
+		}
+	}
+	if len(identities) != 1 {
+		return "", excluded, nil, speechReject("speech_operation_profile_missing_or_ambiguous")
+	}
+	for _, model := range identities {
+		return model, excluded, qualified, nil
+	}
+	return "", excluded, nil, speechReject("speech_operation_profile_required")
 }

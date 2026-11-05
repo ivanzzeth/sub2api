@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -94,7 +95,7 @@ func TestSimpleModeBypassesQuotaCheck(t *testing.T) {
 		cfg.SubscriptionMaintenance.WorkerCount = 1
 		cfg.SubscriptionMaintenance.QueueSize = 1
 
-		apiKeyService := service.NewAPIKeyService(apiKeyRepo, nil, nil, nil, nil, nil, cfg)
+		apiKeyService := service.NewAPIKeyService(apiKeyRepo, nil, &groupContextPolicyRepo{group: apiKey.Group}, nil, nil, nil, cfg)
 
 		past := time.Now().Add(-48 * time.Hour)
 		sub := &service.UserSubscription{
@@ -156,7 +157,7 @@ func TestSimpleModeBypassesQuotaCheck(t *testing.T) {
 
 	t.Run("standard_mode_revalidates_cas_loser_from_database", func(t *testing.T) {
 		cfg := &config.Config{RunMode: config.RunModeStandard}
-		apiKeyService := service.NewAPIKeyService(apiKeyRepo, nil, nil, nil, nil, nil, cfg)
+		apiKeyService := service.NewAPIKeyService(apiKeyRepo, nil, &groupContextPolicyRepo{group: apiKey.Group}, nil, nil, nil, cfg)
 
 		past := time.Now().Add(-48 * time.Hour)
 		current := time.Now()
@@ -203,7 +204,7 @@ func TestSimpleModeBypassesQuotaCheck(t *testing.T) {
 
 	t.Run("simple_mode_bypasses_quota_check", func(t *testing.T) {
 		cfg := &config.Config{RunMode: config.RunModeSimple}
-		apiKeyService := service.NewAPIKeyService(apiKeyRepo, nil, nil, nil, nil, nil, cfg)
+		apiKeyService := service.NewAPIKeyService(apiKeyRepo, nil, &groupContextPolicyRepo{group: apiKey.Group}, nil, nil, nil, cfg)
 		subscriptionService := service.NewSubscriptionService(nil, &stubUserSubscriptionRepo{}, nil, nil, cfg)
 		router := newAuthTestRouter(apiKeyService, subscriptionService, cfg)
 
@@ -217,7 +218,7 @@ func TestSimpleModeBypassesQuotaCheck(t *testing.T) {
 
 	t.Run("simple_mode_accepts_lowercase_bearer", func(t *testing.T) {
 		cfg := &config.Config{RunMode: config.RunModeSimple}
-		apiKeyService := service.NewAPIKeyService(apiKeyRepo, nil, nil, nil, nil, nil, cfg)
+		apiKeyService := service.NewAPIKeyService(apiKeyRepo, nil, &groupContextPolicyRepo{group: apiKey.Group}, nil, nil, nil, cfg)
 		subscriptionService := service.NewSubscriptionService(nil, &stubUserSubscriptionRepo{}, nil, nil, cfg)
 		router := newAuthTestRouter(apiKeyService, subscriptionService, cfg)
 
@@ -231,7 +232,7 @@ func TestSimpleModeBypassesQuotaCheck(t *testing.T) {
 
 	t.Run("standard_mode_enforces_quota_check", func(t *testing.T) {
 		cfg := &config.Config{RunMode: config.RunModeStandard}
-		apiKeyService := service.NewAPIKeyService(apiKeyRepo, nil, nil, nil, nil, nil, cfg)
+		apiKeyService := service.NewAPIKeyService(apiKeyRepo, nil, &groupContextPolicyRepo{group: apiKey.Group}, nil, nil, nil, cfg)
 
 		now := time.Now()
 		sub := &service.UserSubscription{
@@ -268,6 +269,18 @@ func TestSimpleModeBypassesQuotaCheck(t *testing.T) {
 		require.Equal(t, http.StatusTooManyRequests, w.Code)
 		require.Contains(t, w.Body.String(), "USAGE_LIMIT_EXCEEDED")
 	})
+}
+
+type groupContextPolicyRepo struct {
+	service.GroupRepository
+	group *service.Group
+}
+
+func (r *groupContextPolicyRepo) GetByID(_ context.Context, id int64) (*service.Group, error) {
+	if r.group == nil || r.group.ID != id {
+		return nil, service.ErrGroupNotFound
+	}
+	return r.group, nil
 }
 
 func TestAPIKeyAuthSetsGroupContext(t *testing.T) {
@@ -308,7 +321,7 @@ func TestAPIKeyAuthSetsGroupContext(t *testing.T) {
 	}
 
 	cfg := &config.Config{RunMode: config.RunModeSimple}
-	apiKeyService := service.NewAPIKeyService(apiKeyRepo, nil, nil, nil, nil, nil, cfg)
+	apiKeyService := service.NewAPIKeyService(apiKeyRepo, nil, &groupContextPolicyRepo{group: group}, nil, nil, nil, cfg)
 	router := gin.New()
 	router.Use(gin.HandlerFunc(NewAPIKeyAuthMiddleware(apiKeyService, nil, cfg)))
 	router.GET("/t", func(c *gin.Context) {
@@ -372,7 +385,7 @@ func TestAPIKeyAuthRejectsExclusiveGroupWhenUserNoLongerAllowed(t *testing.T) {
 	}
 
 	cfg := &config.Config{RunMode: config.RunModeSimple}
-	apiKeyService := service.NewAPIKeyService(apiKeyRepo, nil, nil, nil, nil, nil, cfg)
+	apiKeyService := service.NewAPIKeyService(apiKeyRepo, nil, &groupContextPolicyRepo{group: apiKey.Group}, nil, nil, nil, cfg)
 	router := newAuthTestRouter(apiKeyService, nil, cfg)
 
 	w := httptest.NewRecorder()
@@ -422,7 +435,7 @@ func TestAPIKeyAuthOverwritesInvalidContextGroup(t *testing.T) {
 	}
 
 	cfg := &config.Config{RunMode: config.RunModeSimple}
-	apiKeyService := service.NewAPIKeyService(apiKeyRepo, nil, nil, nil, nil, nil, cfg)
+	apiKeyService := service.NewAPIKeyService(apiKeyRepo, nil, &groupContextPolicyRepo{group: apiKey.Group}, nil, nil, nil, cfg)
 	router := gin.New()
 	router.Use(gin.HandlerFunc(NewAPIKeyAuthMiddleware(apiKeyService, nil, cfg)))
 
@@ -539,7 +552,7 @@ func TestAPIKeyAuthRejectsUnavailableGroup(t *testing.T) {
 				},
 			}
 			cfg := &config.Config{RunMode: config.RunModeStandard}
-			apiKeyService := service.NewAPIKeyService(apiKeyRepo, nil, nil, nil, nil, nil, cfg)
+			apiKeyService := service.NewAPIKeyService(apiKeyRepo, nil, &groupContextPolicyRepo{group: apiKey.Group}, nil, nil, nil, cfg)
 			router := gin.New()
 			var markedBusinessLimited bool
 			var businessLimitedReason string
@@ -719,7 +732,7 @@ func TestAPIKeyAuthSetsOpsFallbackKeyOnEarlyAbort(t *testing.T) {
 		},
 	}
 	cfg := &config.Config{RunMode: config.RunModeStandard}
-	apiKeyService := service.NewAPIKeyService(apiKeyRepo, nil, nil, nil, nil, nil, cfg)
+	apiKeyService := service.NewAPIKeyService(apiKeyRepo, nil, &groupContextPolicyRepo{group: apiKey.Group}, nil, nil, nil, cfg)
 
 	router := gin.New()
 	var fallback *service.APIKey
@@ -788,7 +801,7 @@ func TestAPIKeyAuthGoogleSetsOpsFallbackKeyOnEarlyAbort(t *testing.T) {
 		},
 	}
 	cfg := &config.Config{RunMode: config.RunModeStandard}
-	apiKeyService := service.NewAPIKeyService(apiKeyRepo, nil, nil, nil, nil, nil, cfg)
+	apiKeyService := service.NewAPIKeyService(apiKeyRepo, nil, &groupContextPolicyRepo{group: apiKey.Group}, nil, nil, nil, cfg)
 
 	router := gin.New()
 	var fallback *service.APIKey
@@ -894,7 +907,7 @@ func TestAPIKeyAuthIPRestrictionUsesTrustedPathWhenSwitchDisabled(t *testing.T) 
 
 	cfg := &config.Config{RunMode: config.RunModeSimple}
 	cfg.SetTrustForwardedIPForAPIKeyACL(false)
-	apiKeyService := service.NewAPIKeyService(apiKeyRepo, nil, nil, nil, nil, nil, cfg)
+	apiKeyService := service.NewAPIKeyService(apiKeyRepo, nil, &groupContextPolicyRepo{group: apiKey.Group}, nil, nil, nil, cfg)
 	router := gin.New()
 	require.NoError(t, router.SetTrustedProxies(nil))
 	var markedBusinessLimited bool
@@ -956,7 +969,7 @@ func TestAPIKeyAuthIPRestrictionIncludesClientIPForBlacklistDenial(t *testing.T)
 	}
 
 	cfg := &config.Config{RunMode: config.RunModeSimple}
-	apiKeyService := service.NewAPIKeyService(apiKeyRepo, nil, nil, nil, nil, nil, cfg)
+	apiKeyService := service.NewAPIKeyService(apiKeyRepo, nil, &groupContextPolicyRepo{group: apiKey.Group}, nil, nil, nil, cfg)
 	router := gin.New()
 	require.NoError(t, router.SetTrustedProxies(nil))
 	router.Use(gin.HandlerFunc(NewAPIKeyAuthMiddleware(apiKeyService, nil, cfg)))
@@ -1005,7 +1018,7 @@ func TestAPIKeyAuthIPRestrictionUsesConfiguredTrustedProxy(t *testing.T) {
 
 	cfg := &config.Config{RunMode: config.RunModeSimple}
 	cfg.SetTrustForwardedIPForAPIKeyACL(false)
-	apiKeyService := service.NewAPIKeyService(apiKeyRepo, nil, nil, nil, nil, nil, cfg)
+	apiKeyService := service.NewAPIKeyService(apiKeyRepo, nil, &groupContextPolicyRepo{group: apiKey.Group}, nil, nil, nil, cfg)
 	router := gin.New()
 	require.NoError(t, router.SetTrustedProxies([]string{"9.9.9.9"}))
 	router.Use(gin.HandlerFunc(NewAPIKeyAuthMiddleware(apiKeyService, nil, cfg)))
@@ -1056,7 +1069,7 @@ func TestAPIKeyAuthIPRestrictionUsesForwardedClientIPInDenialWhenTrusted(t *test
 
 	cfg := &config.Config{RunMode: config.RunModeSimple}
 	cfg.SetTrustForwardedIPForAPIKeyACL(false)
-	apiKeyService := service.NewAPIKeyService(apiKeyRepo, nil, nil, nil, nil, nil, cfg)
+	apiKeyService := service.NewAPIKeyService(apiKeyRepo, nil, &groupContextPolicyRepo{group: apiKey.Group}, nil, nil, nil, cfg)
 	router := gin.New()
 	require.NoError(t, router.SetTrustedProxies([]string{"9.9.9.9"}))
 	router.Use(gin.HandlerFunc(NewAPIKeyAuthMiddleware(apiKeyService, nil, cfg)))
@@ -1113,7 +1126,7 @@ func TestAPIKeyAuthTouchesLastUsedOnSuccess(t *testing.T) {
 	}
 
 	cfg := &config.Config{RunMode: config.RunModeSimple}
-	apiKeyService := service.NewAPIKeyService(apiKeyRepo, nil, nil, nil, nil, nil, cfg)
+	apiKeyService := service.NewAPIKeyService(apiKeyRepo, nil, &groupContextPolicyRepo{group: apiKey.Group}, nil, nil, nil, cfg)
 	router := newAuthTestRouter(apiKeyService, nil, cfg)
 
 	w := httptest.NewRecorder()
@@ -1160,7 +1173,7 @@ func TestAPIKeyAuthTouchLastUsedFailureDoesNotBlock(t *testing.T) {
 	}
 
 	cfg := &config.Config{RunMode: config.RunModeSimple}
-	apiKeyService := service.NewAPIKeyService(apiKeyRepo, nil, nil, nil, nil, nil, cfg)
+	apiKeyService := service.NewAPIKeyService(apiKeyRepo, nil, &groupContextPolicyRepo{group: apiKey.Group}, nil, nil, nil, cfg)
 	router := newAuthTestRouter(apiKeyService, nil, cfg)
 
 	w := httptest.NewRecorder()
@@ -1206,7 +1219,7 @@ func TestAPIKeyAuthTouchesLastUsedInStandardMode(t *testing.T) {
 	}
 
 	cfg := &config.Config{RunMode: config.RunModeStandard}
-	apiKeyService := service.NewAPIKeyService(apiKeyRepo, nil, nil, nil, nil, nil, cfg)
+	apiKeyService := service.NewAPIKeyService(apiKeyRepo, nil, &groupContextPolicyRepo{group: apiKey.Group}, nil, nil, nil, cfg)
 	router := newAuthTestRouter(apiKeyService, nil, cfg)
 
 	w := httptest.NewRecorder()
@@ -1268,7 +1281,7 @@ func TestAPIKeyAuthBillingInfoSkipsBillingAndSideEffects(t *testing.T) {
 		},
 	}
 	cfg := &config.Config{RunMode: config.RunModeStandard}
-	apiKeyService := service.NewAPIKeyService(apiKeyRepo, nil, nil, nil, nil, nil, cfg)
+	apiKeyService := service.NewAPIKeyService(apiKeyRepo, nil, &groupContextPolicyRepo{group: apiKey.Group}, nil, nil, nil, cfg)
 	subscriptionService := service.NewSubscriptionService(nil, subscriptionRepo, nil, nil, cfg)
 	t.Cleanup(subscriptionService.Stop)
 	router := newAuthTestRouter(apiKeyService, subscriptionService, cfg)
@@ -1300,7 +1313,7 @@ func TestAPIKeyAuthBillingInfoSkipsLastUsedInSimpleMode(t *testing.T) {
 		},
 	}
 	cfg := &config.Config{RunMode: config.RunModeSimple}
-	apiKeyService := service.NewAPIKeyService(apiKeyRepo, nil, nil, nil, nil, nil, cfg)
+	apiKeyService := service.NewAPIKeyService(apiKeyRepo, nil, &groupContextPolicyRepo{group: apiKey.Group}, nil, nil, nil, cfg)
 	router := newAuthTestRouter(apiKeyService, nil, cfg)
 
 	w := httptest.NewRecorder()
@@ -1329,7 +1342,7 @@ func TestAPIKeyAuthUsageStillTouchesLastUsed(t *testing.T) {
 		},
 	}
 	cfg := &config.Config{RunMode: config.RunModeStandard}
-	apiKeyService := service.NewAPIKeyService(apiKeyRepo, nil, nil, nil, nil, nil, cfg)
+	apiKeyService := service.NewAPIKeyService(apiKeyRepo, nil, &groupContextPolicyRepo{group: apiKey.Group}, nil, nil, nil, cfg)
 	router := newAuthTestRouter(apiKeyService, nil, cfg)
 
 	w := httptest.NewRecorder()
@@ -1372,7 +1385,7 @@ func TestAPIKeyAuthAllowsBalanceBelowMinimumReserve(t *testing.T) {
 
 	cfg := &config.Config{RunMode: config.RunModeStandard}
 	cfg.Billing.MinimumBalanceReserve = 0.01
-	apiKeyService := service.NewAPIKeyService(apiKeyRepo, nil, nil, nil, nil, nil, cfg)
+	apiKeyService := service.NewAPIKeyService(apiKeyRepo, nil, &groupContextPolicyRepo{group: apiKey.Group}, nil, nil, nil, cfg)
 	router := newAuthTestRouter(apiKeyService, nil, cfg)
 
 	w := httptest.NewRecorder()
@@ -1415,7 +1428,7 @@ func TestAPIKeyAuthRejectsExhaustedBalance(t *testing.T) {
 	}
 
 	cfg := &config.Config{RunMode: config.RunModeStandard}
-	apiKeyService := service.NewAPIKeyService(apiKeyRepo, nil, nil, nil, nil, nil, cfg)
+	apiKeyService := service.NewAPIKeyService(apiKeyRepo, nil, &groupContextPolicyRepo{group: apiKey.Group}, nil, nil, nil, cfg)
 	router := newAuthTestRouter(apiKeyService, nil, cfg)
 
 	w := httptest.NewRecorder()
@@ -1440,7 +1453,7 @@ func TestAPIKeyAuthModelDiscoverySkipsBillingButNotAuthentication(t *testing.T) 
 	}}
 	cfg := &config.Config{RunMode: config.RunModeStandard}
 	router := gin.New()
-	router.Use(gin.HandlerFunc(NewAPIKeyAuthMiddleware(service.NewAPIKeyService(apiKeyRepo, nil, nil, nil, nil, nil, cfg), nil, cfg)))
+	router.Use(gin.HandlerFunc(NewAPIKeyAuthMiddleware(service.NewAPIKeyService(apiKeyRepo, nil, &groupContextPolicyRepo{group: apiKey.Group}, nil, nil, nil, cfg), nil, cfg)))
 	ok := func(c *gin.Context) { c.Status(http.StatusOK) }
 	router.GET("/v1/models", ok)
 	router.GET("/v1/models/:model", ok)
@@ -1486,7 +1499,7 @@ func TestAPIKeyAuthOpenAIQuotaErrorFormat(t *testing.T) {
 	}}
 
 	cfg := &config.Config{RunMode: config.RunModeStandard}
-	router := newAuthTestRouter(service.NewAPIKeyService(apiKeyRepo, nil, nil, nil, nil, nil, cfg), nil, cfg)
+	router := newAuthTestRouter(service.NewAPIKeyService(apiKeyRepo, nil, &groupContextPolicyRepo{group: apiKey.Group}, nil, nil, nil, cfg), nil, cfg)
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
 	req.Header.Set("x-api-key", apiKey.Key)
@@ -1528,7 +1541,7 @@ func TestAPIKeyAuthQuotaErrorKeepsLegacyFormatOutsideResponses(t *testing.T) {
 	}}
 
 	cfg := &config.Config{RunMode: config.RunModeStandard}
-	router := newAuthTestRouter(service.NewAPIKeyService(apiKeyRepo, nil, nil, nil, nil, nil, cfg), nil, cfg)
+	router := newAuthTestRouter(service.NewAPIKeyService(apiKeyRepo, nil, &groupContextPolicyRepo{group: apiKey.Group}, nil, nil, nil, cfg), nil, cfg)
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
 	req.Header.Set("x-api-key", apiKey.Key)
@@ -1830,4 +1843,170 @@ func (r *stubUserSubscriptionRepo) IncrementUsage(ctx context.Context, id int64,
 
 func (r *stubUserSubscriptionRepo) BatchUpdateExpiredStatus(ctx context.Context) (int64, error) {
 	return 0, errors.New("not implemented")
+}
+
+// These repos model authoritative policy independently of the cached API key.
+type authEntryGroupPolicyRepo struct {
+	service.GroupRepository
+	group   *service.Group
+	fail    bool
+	missing bool
+}
+
+func (r *authEntryGroupPolicyRepo) GetByID(_ context.Context, id int64) (*service.Group, error) {
+	if r.fail {
+		return nil, errors.New("synthetic Group DB failure")
+	}
+	if r.missing {
+		return nil, service.ErrGroupNotFound
+	}
+	return r.group, nil
+}
+
+type authEntryUserPolicyRepo struct {
+	service.UserRepository
+	user *service.User
+	fail bool
+}
+
+func (r *authEntryUserPolicyRepo) GetByID(_ context.Context, id int64) (*service.User, error) {
+	if r.fail {
+		return nil, service.ErrUserNotFound
+	}
+	return r.user, nil
+}
+func TestBothAuthEntriesUseFreshPrivateGrantAndTrustedScope(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, google := range []bool{false, true} {
+		t.Run(fmt.Sprint("google=", google), func(t *testing.T) {
+			id, other := int64(51), int64(52)
+			group := &service.Group{ID: id, Platform: service.PlatformOpenAI, Status: service.StatusActive, IsExclusive: true, SubscriptionType: "standard"}
+			cachedUser := &service.User{ID: 7, Status: service.StatusActive, Balance: 10}
+			key := &service.APIKey{ID: 10, UserID: 7, Key: "synthetic-only", Status: service.StatusActive, GroupID: &id, Group: group, User: cachedUser}
+			repo := &stubApiKeyRepo{getByKey: func(context.Context, string) (*service.APIKey, error) { copy := *key; return &copy, nil }}
+			gr := &authEntryGroupPolicyRepo{group: group}
+			ur := &authEntryUserPolicyRepo{user: &service.User{ID: 7, Status: service.StatusActive, Balance: 10, AllowedGroups: []int64{id}}}
+			cfg := &config.Config{RunMode: config.RunModeStandard}
+			svc := service.NewAPIKeyService(repo, ur, gr, nil, nil, nil, cfg)
+			router := gin.New()
+			var fallback *service.APIKey
+			var business, rejected bool
+			var reason IngressRejectReason
+			router.Use(func(c *gin.Context) {
+				c.Next()
+				fallback, _ = GetOpsFallbackAPIKey(c)
+				business = service.HasOpsClientBusinessLimited(c)
+				reason, rejected = GetIngressRejectReason(c)
+			})
+			if google {
+				router.Use(APIKeyAuthGoogle(svc, cfg))
+			} else {
+				router.Use(gin.HandlerFunc(NewAPIKeyAuthMiddleware(svc, nil, cfg)))
+			}
+			checkMetadata := func(want IngressRejectReason, limited bool) {
+				require.NotNil(t, fallback)
+				require.Equal(t, key.ID, fallback.ID)
+				require.NotNil(t, fallback.GroupID)
+				require.Equal(t, id, *fallback.GroupID)
+				require.True(t, rejected)
+				require.Equal(t, want, reason)
+				require.Equal(t, limited, business)
+			}
+			hits := 0
+			router.GET("/v1/models", func(c *gin.Context) {
+				hits++
+				require.False(t, service.PrivateGroupScopeAllows(c.Request.Context(), &other))
+				c.JSON(200, gin.H{"ok": true})
+			})
+			request := func() int {
+				w := httptest.NewRecorder()
+				req := httptest.NewRequest("GET", "/v1/models", nil)
+				req.Header.Set("Authorization", "Bearer "+key.Key)
+				router.ServeHTTP(w, req)
+				return w.Code
+			}
+			require.Equal(t, 200, request())
+			require.Equal(t, 1, hits)
+			require.Empty(t, cachedUser.AllowedGroups, "fresh grant must override an old missing grant")
+			cachedUser.AllowedGroups = []int64{id}
+			ur.user = &service.User{ID: 7, Status: service.StatusActive, Balance: 10}
+			require.Equal(t, 403, request())
+			require.Equal(t, 1, hits)
+			checkMetadata(IngressRejectGroupNotAllowed, true)
+			require.Equal(t, []int64{id}, cachedUser.AllowedGroups)
+			ur.fail = true
+			require.Equal(t, 503, request())
+			require.Equal(t, 1, hits)
+			checkMetadata(IngressRejectAPIKeyAuthOverloaded, false)
+			ur.fail = false
+			gr.fail = true
+			require.Equal(t, 503, request())
+			require.Equal(t, 1, hits)
+			checkMetadata(IngressRejectAPIKeyAuthOverloaded, false)
+		})
+	}
+}
+func TestBothAuthEntriesPublicAndSubscriptionPolicyRead(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, google := range []bool{false, true} {
+		for _, subscription := range []bool{false, true} {
+			t.Run(fmt.Sprint(google, "/", subscription), func(t *testing.T) {
+				id := int64(61)
+				group := &service.Group{ID: id, Status: service.StatusActive, SubscriptionType: "standard"}
+				if subscription {
+					group.SubscriptionType = service.SubscriptionTypeSubscription
+					group.IsExclusive = true
+				}
+				key := &service.APIKey{ID: 3, UserID: 7, Key: "synthetic-only", Status: service.StatusActive, GroupID: &id, Group: group, User: &service.User{ID: 7, Status: service.StatusActive, Balance: 10}}
+				repo := &stubApiKeyRepo{getByKey: func(context.Context, string) (*service.APIKey, error) { copy := *key; return &copy, nil }}
+				gr := &authEntryGroupPolicyRepo{group: group}
+				cfg := &config.Config{RunMode: config.RunModeSimple}
+				svc := service.NewAPIKeyService(repo, nil, gr, nil, nil, nil, cfg)
+				router := gin.New()
+				var fallback *service.APIKey
+				var business, rejected bool
+				var reason IngressRejectReason
+				router.Use(func(c *gin.Context) {
+					c.Next()
+					fallback, _ = GetOpsFallbackAPIKey(c)
+					business = service.HasOpsClientBusinessLimited(c)
+					reason, rejected = GetIngressRejectReason(c)
+				})
+				if google {
+					router.Use(APIKeyAuthGoogle(svc, cfg))
+				} else {
+					router.Use(gin.HandlerFunc(NewAPIKeyAuthMiddleware(svc, nil, cfg)))
+				}
+				checkMetadata := func(want IngressRejectReason, limited bool) {
+					require.NotNil(t, fallback)
+					require.Equal(t, key.ID, fallback.ID)
+					require.NotNil(t, fallback.GroupID)
+					require.Equal(t, id, *fallback.GroupID)
+					require.True(t, rejected)
+					require.Equal(t, want, reason)
+					require.Equal(t, limited, business)
+				}
+				hits := 0
+				router.GET("/v1/models", func(c *gin.Context) { hits++; c.JSON(200, gin.H{"ok": true}) })
+				request := func() int {
+					w := httptest.NewRecorder()
+					req := httptest.NewRequest("GET", "/v1/models", nil)
+					req.Header.Set("Authorization", "Bearer "+key.Key)
+					router.ServeHTTP(w, req)
+					return w.Code
+				}
+				require.Equal(t, 200, request())
+				require.Equal(t, 1, hits)
+				gr.fail = true
+				require.Equal(t, 503, request())
+				require.Equal(t, 1, hits)
+				checkMetadata(IngressRejectAPIKeyAuthOverloaded, false)
+				gr.fail = false
+				gr.missing = true
+				require.Equal(t, 403, request())
+				require.Equal(t, 1, hits)
+				checkMetadata(IngressRejectGroupNotAllowed, true)
+			})
+		}
+	}
 }

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/domain"
 	infraerrors "github.com/Wei-Shaw/sub2api/internal/pkg/errors"
@@ -43,6 +44,7 @@ type createChannelRequest struct {
 }
 
 type updateChannelRequest struct {
+	ExpectedUpdatedAt          *time.Time                        `json:"expected_updated_at"`
 	Name                       string                            `json:"name" binding:"omitempty,max=100"`
 	Description                *string                           `json:"description"`
 	Status                     string                            `json:"status" binding:"omitempty,oneof=active disabled"`
@@ -113,6 +115,7 @@ type accountStatsPricingRuleRequest struct {
 }
 
 type channelResponse struct {
+	SupportsConditionalUpdate  bool                              `json:"supports_conditional_update"`
 	ID                         int64                             `json:"id"`
 	Name                       string                            `json:"name"`
 	Description                string                            `json:"description"`
@@ -193,17 +196,18 @@ func channelToResponse(ch *service.Channel) *channelResponse {
 		return nil
 	}
 	resp := &channelResponse{
-		ID:             ch.ID,
-		Name:           ch.Name,
-		Description:    ch.Description,
-		Status:         ch.Status,
-		RestrictModels: ch.RestrictModels,
-		Features:       ch.Features,
-		FeaturesConfig: ch.FeaturesConfig,
-		GroupIDs:       ch.GroupIDs,
-		ModelMapping:   ch.ModelMapping,
-		CreatedAt:      ch.CreatedAt.Format("2006-01-02T15:04:05Z"),
-		UpdatedAt:      ch.UpdatedAt.Format("2006-01-02T15:04:05Z"),
+		SupportsConditionalUpdate: true,
+		ID:                        ch.ID,
+		Name:                      ch.Name,
+		Description:               ch.Description,
+		Status:                    ch.Status,
+		RestrictModels:            ch.RestrictModels,
+		Features:                  ch.Features,
+		FeaturesConfig:            ch.FeaturesConfig,
+		GroupIDs:                  ch.GroupIDs,
+		ModelMapping:              ch.ModelMapping,
+		CreatedAt:                 ch.CreatedAt.Format("2006-01-02T15:04:05Z"),
+		UpdatedAt:                 ch.UpdatedAt.UTC().Format(time.RFC3339Nano),
 	}
 	resp.BillingModelSource = ch.BillingModelSource
 	if resp.GroupIDs == nil {
@@ -527,7 +531,12 @@ func (h *ChannelHandler) Update(c *gin.Context) {
 		return
 	}
 
+	if req.ExpectedUpdatedAt != nil && req.ExpectedUpdatedAt.IsZero() {
+		response.ErrorFrom(c, infraerrors.BadRequest("VALIDATION_ERROR", "expected_updated_at must be a non-zero RFC3339 timestamp"))
+		return
+	}
 	input := &service.UpdateChannelInput{
+		ExpectedUpdatedAt:          req.ExpectedUpdatedAt,
 		Name:                       req.Name,
 		Description:                req.Description,
 		Status:                     req.Status,

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -274,10 +275,11 @@ type googleErrorResponse struct {
 }
 
 func newTestAPIKeyService(repo service.APIKeyRepository) *service.APIKeyService {
+	observed := &authFixtureObservedRepo{APIKeyRepository: repo}
 	return service.NewAPIKeyService(
-		repo,
-		nil, // userRepo (unused in GetByKey)
-		nil, // groupRepo
+		observed,
+		nil, // legacy fixtures do not model a private-standard grant
+		&authFixtureObservedGroupRepo{repo: observed}, // explicit normal Group dependency
 		nil, // userSubRepo
 		nil, // userGroupRateRepo
 		nil, // cache
@@ -371,7 +373,7 @@ func TestApiKeyAuthWithSubscriptionGoogleSetsGroupContext(t *testing.T) {
 			},
 		},
 		nil,
-		nil,
+		&authFixtureObservedGroupRepo{repo: &authFixtureObservedRepo{last: &service.APIKey{Group: group}}},
 		nil,
 		nil,
 		nil,
@@ -907,4 +909,42 @@ func TestApiKeyAuthWithSubscriptionGoogle_SubscriptionLimitExceededReturns429(t 
 	require.Equal(t, http.StatusTooManyRequests, resp.Error.Code)
 	require.Equal(t, "RESOURCE_EXHAUSTED", resp.Error.Status)
 	require.Contains(t, resp.Error.Message, "daily usage limit exceeded")
+}
+
+// Legacy fixture adapter: supplies the same fixture's normal Group read only.
+// Fresh grant/fault tests use separate authoritative repos, not this adapter.
+type authFixtureObservedRepo struct {
+	service.APIKeyRepository
+	mu   sync.Mutex
+	last *service.APIKey
+}
+
+func (r *authFixtureObservedRepo) remember(key *service.APIKey) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.last = key
+}
+func (r *authFixtureObservedRepo) GetByKey(ctx context.Context, key string) (*service.APIKey, error) {
+	v, err := r.APIKeyRepository.GetByKey(ctx, key)
+	r.remember(v)
+	return v, err
+}
+func (r *authFixtureObservedRepo) GetByKeyForAuth(ctx context.Context, key string) (*service.APIKey, error) {
+	v, err := r.APIKeyRepository.GetByKeyForAuth(ctx, key)
+	r.remember(v)
+	return v, err
+}
+
+type authFixtureObservedGroupRepo struct {
+	service.GroupRepository
+	repo *authFixtureObservedRepo
+}
+
+func (r *authFixtureObservedGroupRepo) GetByID(_ context.Context, id int64) (*service.Group, error) {
+	r.repo.mu.Lock()
+	defer r.repo.mu.Unlock()
+	if r.repo.last == nil || r.repo.last.Group == nil || r.repo.last.Group.ID != id {
+		return nil, service.ErrGroupNotFound
+	}
+	return r.repo.last.Group, nil
 }

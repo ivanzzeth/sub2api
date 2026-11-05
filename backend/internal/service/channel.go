@@ -48,6 +48,8 @@ const (
 
 // Channel 渠道实体
 type Channel struct {
+	// Transient single-update precondition; not a database or customer field.
+	ExpectedUpdatedAt  *time.Time `json:"-"`
 	ID                 int64
 	Name               string
 	Description        string

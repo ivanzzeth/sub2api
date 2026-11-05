@@ -75,6 +75,39 @@ func APIKeyAuthWithSubscriptionGoogle(apiKeyService *service.APIKeyService, subs
 			return
 		}
 
+		// Keep the authenticated key available for existing rejection metadata.
+		SetOpsFallbackAPIKey(c, apiKey)
+		refreshedKey, refreshErr := apiKeyService.RefreshPrivateGroupGrant(c.Request.Context(), apiKey)
+		if refreshErr != nil {
+			if errors.Is(refreshErr, service.ErrGroupNotAllowed) {
+				if code, message, ok := validateAPIKeyGroupAvailable(apiKey); !ok {
+					service.MarkOpsClientBusinessLimited(c, service.OpsClientBusinessLimitedReasonAPIKeyGroupUnavailable)
+					if code == "GROUP_DELETED" {
+						MarkIngressRejected(c, IngressRejectGroupDeleted)
+					} else {
+						MarkIngressRejected(c, IngressRejectGroupDisabled)
+					}
+					abortWithGoogleError(c, 403, message)
+					return
+				}
+				service.MarkOpsClientBusinessLimited(c, service.OpsClientBusinessLimitedReasonAPIKeyGroupUnavailable)
+				MarkIngressRejected(c, IngressRejectGroupNotAllowed)
+				abortWithGoogleError(c, 403, "Group is not allowed")
+			} else {
+				MarkIngressRejected(c, IngressRejectAPIKeyAuthOverloaded)
+				abortWithGoogleError(c, 503, "Cannot verify current group permission")
+			}
+			return
+		}
+		apiKey = refreshedKey
+		if apiKey.Group.IsPrivateStandard() && cfg.RunMode == config.RunModeSimple {
+			service.MarkOpsClientBusinessLimited(c, service.OpsClientBusinessLimitedReasonAPIKeyGroupUnavailable)
+			MarkIngressRejected(c, IngressRejectGroupNotAllowed)
+			abortWithGoogleError(c, 403, "Private group isolation requires standard mode")
+			return
+		}
+		c.Request = c.Request.WithContext(service.WithPrivateGroupScope(c.Request.Context(), apiKey.Group))
+
 		// 同 api_key_auth.go：早退中断前也写入 Ops 回退 key，便于错误日志展示
 		// user/group/platform。
 		SetOpsFallbackAPIKey(c, apiKey)

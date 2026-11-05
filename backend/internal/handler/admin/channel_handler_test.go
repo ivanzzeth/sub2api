@@ -3,9 +3,11 @@
 package admin
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -629,4 +631,63 @@ func TestGetModelDefaultPricing_OmitsUnsupportedCache1hPrice(t *testing.T) {
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
 	require.True(t, body.Data.Found)
 	require.Nil(t, body.Data.CacheWrite1hPrice)
+}
+
+// Typed repository double only observes handler/service transport. PostgreSQL atomicity is tested separately.
+type conditionalChannelRepoFixture struct {
+	service.ChannelRepository
+	value        service.Channel
+	updates      int
+	lastExpected *time.Time
+}
+
+func (r *conditionalChannelRepoFixture) GetByID(context.Context, int64) (*service.Channel, error) {
+	v := r.value
+	return &v, nil
+}
+func (r *conditionalChannelRepoFixture) ListAll(context.Context) ([]service.Channel, error) {
+	return nil, nil
+}
+func (r *conditionalChannelRepoFixture) Update(_ context.Context, v *service.Channel) error {
+	r.updates++
+	r.lastExpected = v.ExpectedUpdatedAt
+	if v.ExpectedUpdatedAt != nil && !v.ExpectedUpdatedAt.Equal(r.value.UpdatedAt) {
+		return service.ErrChannelUpdateConflict
+	}
+	r.value = *v
+	r.value.UpdatedAt = r.value.UpdatedAt.Add(time.Microsecond)
+	r.value.ExpectedUpdatedAt = nil
+	return nil
+}
+func TestChannelConditionalHTTPContract(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	stamp := time.Date(2026, 11, 4, 10, 0, 0, 123456000, time.UTC)
+	repo := &conditionalChannelRepoFixture{value: service.Channel{ID: 42, Name: "channel", Status: service.StatusActive, UpdatedAt: stamp, BillingModelSource: service.BillingModelSourceRequested}}
+	h := NewChannelHandler(service.NewChannelService(repo, nil, nil, nil, nil), nil, nil)
+	r := gin.New()
+	r.PUT("/channels/:id", h.Update)
+	r.GET("/channels/:id", h.GetByID)
+	get := httptest.NewRecorder()
+	r.ServeHTTP(get, httptest.NewRequest("GET", "/channels/42", nil))
+	require.Equal(t, 200, get.Code)
+	var body map[string]any
+	require.NoError(t, json.Unmarshal(get.Body.Bytes(), &body))
+	data := body["data"].(map[string]any)
+	require.Equal(t, true, data["supports_conditional_update"])
+	require.Equal(t, stamp.Format(time.RFC3339Nano), data["updated_at"])
+	call := func(raw string) int {
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, httptest.NewRequest("PUT", "/channels/42", strings.NewReader(raw)))
+		return w.Code
+	}
+	require.Equal(t, 200, call(`{"description":"matching","expected_updated_at":"2026-11-04T10:00:00.123456Z"}`))
+	require.True(t, repo.lastExpected.Equal(stamp))
+	require.Equal(t, 409, call(`{"description":"stale","expected_updated_at":"2026-11-04T10:00:00.123456Z"}`))
+	require.Equal(t, "matching", repo.value.Description)
+	calls := repo.updates
+	require.Equal(t, 400, call(`{"expected_updated_at":"bad"}`))
+	require.Equal(t, 400, call(`{"expected_updated_at":"0001-01-01T00:00:00Z"}`))
+	require.Equal(t, calls, repo.updates)
+	require.Equal(t, 200, call(`{"description":"legacy"}`))
+	require.Nil(t, repo.lastExpected)
 }

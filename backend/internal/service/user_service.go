@@ -1439,3 +1439,27 @@ const notifyVerifyEmailTemplate = `<!DOCTYPE html>
 func buildNotifyVerifyEmailBody(code, siteName string) string {
 	return fmt.Sprintf(notifyVerifyEmailTemplate, siteName, code)
 }
+
+// SetAllowedGroup changes one existing authorization relation atomically.
+// It never reads then replaces the full allowed_groups collection.
+func (s *UserService) SetAllowedGroup(ctx context.Context, userID, groupID int64, granted bool) error {
+	if userID <= 0 || groupID <= 0 {
+		return infraerrors.BadRequest("INVALID_GROUP_GRANT", "Invalid user or group")
+	}
+	if _, err := s.userRepo.GetByID(ctx, userID); err != nil {
+		return err
+	}
+	var err error
+	if granted {
+		err = s.userRepo.AddGroupToAllowedGroups(ctx, userID, groupID)
+	} else {
+		err = s.userRepo.RemoveGroupFromUserAllowedGroups(ctx, userID, groupID)
+	}
+	if err != nil {
+		return err
+	}
+	if s.authCacheInvalidator != nil {
+		s.authCacheInvalidator.InvalidateAuthCacheByUserID(ctx, userID)
+	}
+	return nil
+}

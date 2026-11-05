@@ -314,6 +314,7 @@ type CreateGroupInput struct {
 }
 
 type UpdateGroupInput struct {
+	ExpectedUpdatedAt         *time.Time
 	Name                      string
 	Description               *string
 	I18n                      *GroupI18n // nil 表示不修改；非 nil 整体替换

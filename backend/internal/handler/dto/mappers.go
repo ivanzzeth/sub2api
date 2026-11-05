@@ -147,6 +147,7 @@ func GroupFromServiceAdmin(g *service.Group) *AdminGroup {
 		return nil
 	}
 	out := &AdminGroup{
+		SupportsConditionalUpdate:   true,
 		Group:                       groupFromServiceBase(g),
 		ForceOpenAIFast:             g.ForceOpenAIFast,
 		FreeOpenAIFast:              g.FreeOpenAIFast,

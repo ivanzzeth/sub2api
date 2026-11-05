@@ -95,6 +95,9 @@ func filterSystemOneRouteModels(routes []CompositeModelRoute, models []string, e
 }
 
 func (r *CompositeRouteResolver) Resolve(ctx context.Context, groupID int64, model, endpoint string) (CompositeRouteDecision, error) {
+	if !PrivateGroupScopeAllows(ctx, &groupID) {
+		return CompositeRouteDecision{}, ErrPrivateGroupScope
+	}
 	model = strings.TrimSpace(model)
 	endpoint = normalizeCompositeRouteEndpoint(endpoint)
 	decision := CompositeRouteDecision{

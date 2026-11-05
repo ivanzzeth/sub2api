@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	dbent "github.com/Wei-Shaw/sub2api/ent"
 	"github.com/Wei-Shaw/sub2api/ent/group"
@@ -441,7 +442,18 @@ func (r *groupRepository) Update(ctx context.Context, groupIn *service.Group) er
 	}
 	builder = builder.SetI18n(i18n)
 
+	if groupIn.ExpectedUpdatedAt != nil {
+		expected := groupIn.ExpectedUpdatedAt.UTC()
+		next := time.Now().UTC().Truncate(time.Microsecond)
+		if !next.After(expected) {
+			next = expected.Add(time.Microsecond)
+		}
+		builder = builder.Where(group.UpdatedAtEQ(expected)).SetUpdatedAt(next)
+	}
 	updated, err := builder.Save(ctx)
+	if err != nil && groupIn.ExpectedUpdatedAt != nil && dbent.IsNotFound(err) {
+		return service.ErrGroupUpdateConflict
+	}
 	if err != nil {
 		return translatePersistenceError(err, service.ErrGroupNotFound, service.ErrGroupExists)
 	}

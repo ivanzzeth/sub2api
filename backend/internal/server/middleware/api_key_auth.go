@@ -114,6 +114,32 @@ func apiKeyAuthWithSubscription(apiKeyService *service.APIKeyService, subscripti
 			return
 		}
 
+		// Retain the authenticated key even if the authoritative refresh rejects.
+		SetOpsFallbackAPIKey(c, apiKey)
+		refreshedKey, refreshErr := apiKeyService.RefreshPrivateGroupGrant(c.Request.Context(), apiKey)
+		if refreshErr != nil {
+			if errors.Is(refreshErr, service.ErrGroupNotAllowed) {
+				if abortIfAPIKeyGroupUnavailable(c, apiKey) {
+					return
+				}
+				service.MarkOpsClientBusinessLimited(c, service.OpsClientBusinessLimitedReasonAPIKeyGroupUnavailable)
+				MarkIngressRejected(c, IngressRejectGroupNotAllowed)
+				AbortWithError(c, 403, "GROUP_NOT_ALLOWED", "Group is not allowed")
+			} else {
+				MarkIngressRejected(c, IngressRejectAPIKeyAuthOverloaded)
+				AbortWithError(c, 503, "GROUP_AUTH_UNAVAILABLE", "Cannot verify current group permission")
+			}
+			return
+		}
+		apiKey = refreshedKey
+		if apiKey.Group.IsPrivateStandard() && cfg.RunMode == config.RunModeSimple {
+			service.MarkOpsClientBusinessLimited(c, service.OpsClientBusinessLimitedReasonAPIKeyGroupUnavailable)
+			MarkIngressRejected(c, IngressRejectGroupNotAllowed)
+			AbortWithError(c, 403, "PRIVATE_GROUP_SIMPLE_MODE_UNSUPPORTED", "Private group isolation requires standard mode")
+			return
+		}
+		c.Request = c.Request.WithContext(service.WithPrivateGroupScope(c.Request.Context(), apiKey.Group))
+
 		// apiKey 已加载（含 User/Group）。即便后续因分组停用/Key 停用/用户停用/
 		// IP 限制等早退中断，也让 Ops 错误日志能回退取到 user/group/platform。
 		SetOpsFallbackAPIKey(c, apiKey)

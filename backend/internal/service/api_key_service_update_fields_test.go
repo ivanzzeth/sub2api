@@ -131,3 +131,123 @@ func TestUpdateQuotaUsed_ExhaustedMarkOnlyDeclaresStatus(t *testing.T) {
 	require.NoError(t, svc.UpdateQuotaUsed(context.Background(), 1, 5))
 	require.Equal(t, []APIKeyUpdateFields{{Status: true}}, repo.updateFields)
 }
+
+type privateGrantUserRepo struct {
+	UserRepository
+	user *User
+	fail bool
+}
+
+func (r *privateGrantUserRepo) GetByID(context.Context, int64) (*User, error) {
+	if r.fail {
+		return nil, ErrUserNotFound
+	}
+	return r.user, nil
+}
+
+type privateGrantGroupRepo struct {
+	GroupRepository
+	group *Group
+	fail  bool
+}
+
+func (r *privateGrantGroupRepo) GetByID(context.Context, int64) (*Group, error) {
+	if r.fail {
+		return nil, ErrGroupNotAllowed
+	}
+	return r.group, nil
+}
+
+func TestPrivateGrantIgnoresWarmCachedPermission(t *testing.T) {
+	id := int64(9)
+	cached := &APIKey{UserID: 4, GroupID: &id, Group: &Group{ID: id, IsExclusive: true, SubscriptionType: "standard"}, User: &User{ID: 4, Status: StatusActive, AllowedGroups: []int64{id}}}
+	rpm := 23
+	cached.User.UserGroupRPMOverride = &rpm
+	ur := &privateGrantUserRepo{user: &User{ID: 4, Status: StatusActive}}
+	gr := &privateGrantGroupRepo{group: &Group{ID: id, IsExclusive: true, SubscriptionType: "standard", Status: StatusActive}}
+	s := &APIKeyService{userRepo: ur, groupRepo: gr}
+	_, err := s.RefreshPrivateGroupGrant(context.Background(), cached)
+	require.ErrorIs(t, err, ErrGroupNotAllowed)
+	require.Equal(t, []int64{id}, cached.User.AllowedGroups)
+	ur.fail = true
+	_, err = s.RefreshPrivateGroupGrant(context.Background(), cached)
+	require.ErrorIs(t, err, ErrAPIKeyAuthOverloaded)
+	ur.fail = false
+	ur.user.AllowedGroups = []int64{id}
+	cached.User.AllowedGroups = nil // newly granted authority must override stale absence
+	fresh, err := s.RefreshPrivateGroupGrant(context.Background(), cached)
+	require.NoError(t, err)
+	require.NotSame(t, cached, fresh)
+	require.NotSame(t, cached.User, fresh.User)
+	require.NotSame(t, ur.user, fresh.User)
+	require.True(t, fresh.User.CanBindGroup(id, true))
+	require.Empty(t, cached.User.AllowedGroups)
+	require.NotNil(t, fresh.User.UserGroupRPMOverride)
+	require.Equal(t, 23, *fresh.User.UserGroupRPMOverride)
+	*fresh.User.UserGroupRPMOverride = 99
+	require.Equal(t, 23, *cached.User.UserGroupRPMOverride)
+	require.Nil(t, ur.user.UserGroupRPMOverride)
+}
+
+type singleGrantRepo struct {
+	UserRepository
+	grants        map[int64]bool
+	adds, removes int
+}
+
+func (r *singleGrantRepo) GetByID(context.Context, int64) (*User, error) {
+	return &User{ID: 1, Status: StatusActive}, nil
+}
+func (r *singleGrantRepo) AddGroupToAllowedGroups(_ context.Context, _ int64, g int64) error {
+	r.grants[g] = true
+	r.adds++
+	return nil
+}
+func (r *singleGrantRepo) RemoveGroupFromUserAllowedGroups(_ context.Context, _ int64, g int64) error {
+	delete(r.grants, g)
+	r.removes++
+	return nil
+}
+func TestSingleGroupGrantPreservesUnrelatedRelations(t *testing.T) {
+	r := &singleGrantRepo{grants: map[int64]bool{7: true}}
+	s := &UserService{userRepo: r}
+	require.NoError(t, s.SetAllowedGroup(context.Background(), 1, 9, true))
+	require.NoError(t, s.SetAllowedGroup(context.Background(), 1, 9, true))
+	require.True(t, r.grants[7])
+	require.True(t, r.grants[9])
+	require.NoError(t, s.SetAllowedGroup(context.Background(), 1, 9, false))
+	require.NoError(t, s.SetAllowedGroup(context.Background(), 1, 9, false))
+	require.True(t, r.grants[7])
+	require.False(t, r.grants[9])
+	require.Equal(t, 2, r.adds)
+	require.Equal(t, 2, r.removes)
+}
+
+func TestCurrentGroupPolicyReadDependencyForLegacyClasses(t *testing.T) {
+	id := int64(8)
+	for _, g := range []*Group{
+		{ID: id, SubscriptionType: "standard"},
+		{ID: id, IsExclusive: true, SubscriptionType: SubscriptionTypeSubscription},
+	} {
+		gr := &privateGrantGroupRepo{group: g}
+		// User repository deliberately absent: public/subscription grant rules stay native.
+		s := &APIKeyService{groupRepo: gr}
+		cached := &APIKey{GroupID: &id, Group: g}
+		same, err := s.RefreshPrivateGroupGrant(context.Background(), cached)
+		require.NoError(t, err)
+		require.Same(t, cached, same)
+		gr.fail = true
+		_, err = s.RefreshPrivateGroupGrant(context.Background(), cached)
+		require.ErrorIs(t, err, ErrAPIKeyAuthOverloaded)
+	}
+}
+
+func TestPrivateGrantMissingRepositoriesFailsClosed(t *testing.T) {
+	id := int64(9)
+	key := &APIKey{UserID: 4, GroupID: &id}
+	_, err := (&APIKeyService{}).RefreshPrivateGroupGrant(context.Background(), key)
+	require.ErrorIs(t, err, ErrAPIKeyAuthOverloaded)
+	s := &APIKeyService{groupRepo: &privateGrantGroupRepo{group: &Group{ID: id, IsExclusive: true, SubscriptionType: "standard"}}}
+	_, err = s.RefreshPrivateGroupGrant(context.Background(), key)
+	require.ErrorIs(t, err, ErrAPIKeyAuthOverloaded)
+}

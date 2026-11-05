@@ -180,7 +180,7 @@ func sanitizeUpdateGroupRequestForSimpleMode(req *UpdateGroupRequest) {
 	if req == nil {
 		return
 	}
-	*req = UpdateGroupRequest{Name: req.Name, Description: req.Description, I18n: req.I18n}
+	*req = UpdateGroupRequest{Name: req.Name, Description: req.Description, I18n: req.I18n, ExpectedUpdatedAt: req.ExpectedUpdatedAt}
 }
 
 // CreateGroupRequest represents create group request
@@ -260,6 +260,7 @@ type CreateGroupRequest struct {
 
 // UpdateGroupRequest represents update group request
 type UpdateGroupRequest struct {
+	ExpectedUpdatedAt         *time.Time                     `json:"expected_updated_at"`
 	Name                      string                         `json:"name"`
 	Description               *string                        `json:"description"`
 	I18n                      *service.GroupI18n             `json:"i18n"` // 缺省不修改，传入则整体替换
@@ -812,7 +813,12 @@ func (h *GroupHandler) Update(c *gin.Context) {
 		sanitizeUpdateGroupRequestForSimpleMode(&req)
 	}
 
+	if req.ExpectedUpdatedAt != nil && req.ExpectedUpdatedAt.IsZero() {
+		response.BadRequest(c, "expected_updated_at must be a non-zero RFC3339 timestamp")
+		return
+	}
 	group, err := h.adminService.UpdateGroup(c.Request.Context(), groupID, &service.UpdateGroupInput{
+		ExpectedUpdatedAt:               req.ExpectedUpdatedAt,
 		Name:                            req.Name,
 		Description:                     req.Description,
 		I18n:                            req.I18n,

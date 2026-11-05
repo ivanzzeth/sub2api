@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"html"
 	"math"
@@ -1215,4 +1216,48 @@ func (s *APIKeyService) UpdateRateLimitUsage(ctx context.Context, apiKeyID int64
 		return nil
 	}
 	return s.apiKeyRepo.IncrementRateLimitUsage(ctx, apiKeyID, cost)
+}
+
+// RefreshPrivateGroupGrant reads current Group policy for every grouped key.
+// A Group repository failure is a new availability dependency for public and
+// subscription keys too; only private-standard grants bypass the user cache.
+// Returning a copy prevents a request from modifying the shared auth snapshot.
+func (s *APIKeyService) RefreshPrivateGroupGrant(ctx context.Context, key *APIKey) (*APIKey, error) {
+	if key == nil || key.GroupID == nil {
+		return key, nil
+	}
+	if s == nil || s.groupRepo == nil {
+		return nil, ErrAPIKeyAuthOverloaded
+	}
+	group, err := s.groupRepo.GetByID(ctx, *key.GroupID)
+	if errors.Is(err, ErrGroupNotFound) || err == nil && group == nil {
+		return nil, ErrGroupNotAllowed
+	}
+	if err != nil {
+		return nil, ErrAPIKeyAuthOverloaded
+	}
+	if !group.IsPrivateStandard() {
+		return key, nil
+	}
+	if s.userRepo == nil {
+		return nil, ErrAPIKeyAuthOverloaded
+	}
+	user, err := s.userRepo.GetByID(ctx, key.UserID)
+	if err != nil || user == nil {
+		return nil, ErrAPIKeyAuthOverloaded
+	}
+	if !user.IsActive() || !user.CanBindGroup(group.ID, true) {
+		return nil, ErrGroupNotAllowed
+	}
+	// This field is enriched by the native auth cache, not UserRepository.GetByID.
+	// Keep its value without aliasing the cached pointer or changing grant authority.
+	freshUser := *user
+	if key.User != nil && key.User.UserGroupRPMOverride != nil {
+		override := *key.User.UserGroupRPMOverride
+		freshUser.UserGroupRPMOverride = &override
+	}
+	copy := *key
+	id := group.ID
+	copy.GroupID, copy.Group, copy.User = &id, group, &freshUser
+	return &copy, nil
 }

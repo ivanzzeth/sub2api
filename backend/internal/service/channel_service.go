@@ -19,6 +19,7 @@ import (
 )
 
 var (
+	ErrChannelUpdateConflict = infraerrors.Conflict("CHANNEL_UPDATE_CONFLICT", "channel changed; reload before updating")
 	ErrChannelNotFound       = infraerrors.NotFound("CHANNEL_NOT_FOUND", "channel not found")
 	ErrChannelExists         = infraerrors.Conflict("CHANNEL_EXISTS", "channel name already exists")
 	ErrGroupAlreadyInChannel = infraerrors.Conflict(
@@ -935,6 +936,7 @@ func (s *ChannelService) Update(ctx context.Context, id int64, input *UpdateChan
 
 // applyUpdateInput 将更新请求的字段应用到渠道实体上。
 func (s *ChannelService) applyUpdateInput(ctx context.Context, channel *Channel, input *UpdateChannelInput) error {
+	channel.ExpectedUpdatedAt = input.ExpectedUpdatedAt
 	if input.Name != "" && input.Name != channel.Name {
 		exists, err := s.repo.ExistsByNameExcluding(ctx, input.Name, channel.ID)
 		if err != nil {
@@ -1180,6 +1182,7 @@ type CreateChannelInput struct {
 
 // UpdateChannelInput 更新渠道输入
 type UpdateChannelInput struct {
+	ExpectedUpdatedAt          *time.Time
 	Name                       string
 	Description                *string
 	Status                     string

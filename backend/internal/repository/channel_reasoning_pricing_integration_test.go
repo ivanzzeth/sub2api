@@ -4,7 +4,9 @@ package repository
 
 import (
 	"context"
+	"errors"
 	"math"
+	"sync"
 	"testing"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
@@ -178,4 +180,91 @@ func TestGroupReasoningPricingRoundTripAndBilling(t *testing.T) {
 		require.NoError(t, repo.Update(ctx, loaded))
 		loaded = assertStoredAndBilled(multipliers)
 	}
+}
+
+func TestChannelConditionalUpdateAtomic(t *testing.T) {
+	ctx := context.Background()
+	in, out := .000123, .000456
+	foreign := service.ChannelModelPricing{Platform: service.PlatformOpenAI, Models: []string{"foreign-a", "foreign-b"}, BillingMode: service.BillingModeToken, InputPrice: &in, OutputPrice: &out, ReasoningEffortMultipliers: map[string]float64{"high": 1.5}, Intervals: []service.PricingInterval{{MinTokens: 0, InputPrice: &in, OutputPrice: &out}}}
+	owned := service.ChannelModelPricing{Platform: service.PlatformOpenAI, Models: []string{"owned-old"}, BillingMode: service.BillingModeToken, InputPrice: &in, OutputPrice: &out}
+	ch := &service.Channel{ModelPricing: []service.ChannelModelPricing{foreign, owned}, ModelMapping: map[string]map[string]string{"openai": {"foreign-a": "real-foreign"}}}
+	repo := newReasoningPricingIntegrationChannel(t, ch)
+	one, err := repo.GetByID(ctx, ch.ID)
+	require.NoError(t, err)
+	two, err := repo.GetByID(ctx, ch.ID)
+	require.NoError(t, err)
+	version := one.UpdatedAt
+	one.ExpectedUpdatedAt = &version
+	two.ExpectedUpdatedAt = &version
+	one.Description = "add-owned"
+	one.ModelPricing = append(one.ModelPricing, service.ChannelModelPricing{Platform: service.PlatformOpenAI, Models: []string{"owned-new"}, BillingMode: service.BillingModeToken, InputPrice: &in, OutputPrice: &out})
+	two.Description = "remove-owned"
+	two.ModelPricing = two.ModelPricing[:1]
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	var wg sync.WaitGroup
+	for _, x := range []*service.Channel{one, two} {
+		wg.Add(1)
+		go func(v *service.Channel) { defer wg.Done(); <-start; results <- repo.Update(ctx, v) }(x)
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+	ok, conflicts := 0, 0
+	for e := range results {
+		if e == nil {
+			ok++
+		} else {
+			require.ErrorIs(t, e, service.ErrChannelUpdateConflict)
+			conflicts++
+		}
+	}
+	require.Equal(t, 1, ok)
+	require.Equal(t, 1, conflicts)
+	after, err := repo.GetByID(ctx, ch.ID)
+	require.NoError(t, err)
+	require.True(t, after.UpdatedAt.After(version))
+	require.Equal(t, foreign.Models, after.ModelPricing[0].Models)
+	require.Equal(t, in, *after.ModelPricing[0].InputPrice)
+	require.Equal(t, out, *after.ModelPricing[0].Intervals[0].OutputPrice)
+	require.Equal(t, foreign.ReasoningEffortMultipliers, after.ModelPricing[0].ReasoningEffortMultipliers)
+	require.Equal(t, ch.ModelMapping, after.ModelMapping)
+	if after.Description == "add-owned" {
+		require.Len(t, after.ModelPricing, 3)
+	} else {
+		require.Equal(t, "remove-owned", after.Description)
+		require.Len(t, after.ModelPricing, 1)
+	}
+	stale := *after
+	stale.ExpectedUpdatedAt = &version
+	stale.ModelPricing = []service.ChannelModelPricing{}
+	stale.GroupIDs = []int64{}
+	require.ErrorIs(t, repo.Update(ctx, &stale), service.ErrChannelUpdateConflict)
+	same, err := repo.GetByID(ctx, ch.ID)
+	require.NoError(t, err)
+	require.Equal(t, after, same) // Includes child IDs/intervals: conflict never delete/reinserts them.
+	// A failure in child pricing insertion rolls back the successful parent/version mutation too.
+	bad := *after
+	current := after.UpdatedAt
+	bad.ExpectedUpdatedAt = &current
+	bad.Description = "must-rollback"
+	bad.ModelPricing = []service.ChannelModelPricing{{Platform: service.PlatformOpenAI, Models: []string{"bad"}, ReasoningEffortMultipliers: map[string]float64{"high": math.NaN()}}}
+	err = repo.Update(ctx, &bad)
+	require.Error(t, err)
+	require.False(t, errors.Is(err, service.ErrChannelUpdateConflict))
+	same, err = repo.GetByID(ctx, ch.ID)
+	require.NoError(t, err)
+	require.Equal(t, after, same)
+	legacy := *after
+	legacy.ExpectedUpdatedAt = nil
+	legacy.Description = "legacy-update"
+	require.NoError(t, repo.Update(ctx, &legacy))
+	missing := legacy
+	missing.ID = -1
+	require.ErrorIs(t, repo.Update(ctx, &missing), service.ErrChannelNotFound)
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+	err = repo.Update(canceled, &legacy)
+	require.Error(t, err)
+	require.False(t, errors.Is(err, service.ErrChannelUpdateConflict))
 }

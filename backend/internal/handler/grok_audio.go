@@ -184,7 +184,7 @@ func isExpectedGrokRealtimeClose(err error) bool {
 // GrokVoice handles xAI Voice HTTP endpoints. endpoint is "tts", "stt", or "custom-voices".
 func (h *OpenAIGatewayHandler) GrokVoice(c *gin.Context, endpoint string) {
 	apiKey, ok := middleware2.GetAPIKeyFromContext(c)
-	if !ok || apiKey.Group == nil || apiKey.Group.Platform != service.PlatformGrok {
+	if !ok || apiKey == nil || apiKey.Group == nil || (apiKey.Group.Platform != service.PlatformGrok && !(endpoint == "tts" && apiKey.Group.Platform == service.PlatformOpenAI)) {
 		h.errorResponse(c, http.StatusNotFound, "not_found_error", "Voice API is not supported for this platform")
 		return
 	}
@@ -245,6 +245,18 @@ func (h *OpenAIGatewayHandler) GrokVoice(c *gin.Context, endpoint string) {
 	var last *service.UpstreamFailoverError
 	reqLog := requestLogger(c, "handler.openai_gateway.grok_voice", zap.String("endpoint", endpoint))
 	selectionModel := "grok-4.5"
+	selectionCapability := service.OpenAIEndpointCapabilityChatCompletions
+	selectionPlatform := service.PlatformGrok
+	if endpoint == "tts" {
+		selectionPlatform = apiKey.Group.Platform
+		selectionCapability = ""
+		var selectErr error
+		selectionModel, failed, selectErr = h.gatewayService.ResolveGrokTTSSelectionModel(c.Request.Context(), apiKey)
+		if selectErr != nil {
+			h.errorResponse(c, http.StatusBadRequest, "speech_operation_unsupported", selectErr.Error())
+			return
+		}
+	}
 
 	for attempts := 0; attempts < 4; attempts++ {
 		selection, _, selectErr := h.gatewayService.SelectAccountWithSchedulerForCapability(
@@ -255,11 +267,11 @@ func (h *OpenAIGatewayHandler) GrokVoice(c *gin.Context, endpoint string) {
 			selectionModel,
 			failed,
 			service.OpenAIUpstreamTransportHTTPSSE,
-			service.OpenAIEndpointCapabilityChatCompletions,
+			selectionCapability,
 			false,
 			false,
 			false,
-			service.PlatformGrok,
+			selectionPlatform,
 		)
 		if selectErr != nil || selection == nil || selection.Account == nil {
 			if last != nil {
@@ -270,6 +282,10 @@ func (h *OpenAIGatewayHandler) GrokVoice(c *gin.Context, endpoint string) {
 			return
 		}
 		account := selection.Account
+		if endpoint == "tts" && !service.SpeechAccountBelongsToGroup(apiKey, account) {
+			h.errorResponse(c, http.StatusForbidden, "permission_error", "Voice account is outside the original Key group")
+			return
+		}
 		var started bool
 		release, status := h.acquireResponsesAccountSlot(c, apiKey.GroupID, "", selection, false, &started, reqLog)
 		if status == openAISlotAcquireProfitVetoed {
@@ -287,8 +303,20 @@ func (h *OpenAIGatewayHandler) GrokVoice(c *gin.Context, endpoint string) {
 		}
 		result, forwardErr := func() (*service.OpenAIForwardResult, error) {
 			defer release()
+			if endpoint == "tts" {
+				result, qualifiedAccount, err := h.gatewayService.ForwardGrokTTSForKey(c.Request.Context(), c, apiKey, account, selectionModel, body, contentType)
+				if qualifiedAccount != nil {
+					account = qualifiedAccount
+				}
+				return result, err
+			}
 			return h.gatewayService.ForwardGrokVoice(c.Request.Context(), c, account, endpoint, body, contentType)
 		}()
+		var prewrite *service.SpeechPrewriteError
+		if errors.As(forwardErr, &prewrite) {
+			h.errorResponse(c, http.StatusBadRequest, prewrite.Code, prewrite.Error())
+			return
+		}
 		if forwardErr == nil {
 			h.recordGrokVoiceUsage(c, apiKey, account, subscription, endpoint, body, result)
 			return

@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -84,4 +85,35 @@ func TestUserCanBindGroup(t *testing.T) {
 			require.Equal(t, tc.want, user.CanBindGroup(tc.groupID, tc.isExclusive))
 		})
 	}
+}
+
+func TestPrivateScopePreservesOriginalGroupAndLegacyClasses(t *testing.T) {
+	id, other := int64(5), int64(6)
+	for _, tc := range []struct {
+		group  *Group
+		locked bool
+	}{
+		{&Group{ID: id, IsExclusive: true, SubscriptionType: "standard"}, true},
+		{&Group{ID: id}, false},
+		{&Group{ID: id, IsExclusive: true, SubscriptionType: SubscriptionTypeSubscription}, false},
+	} {
+		ctx := WithPrivateGroupScope(context.Background(), tc.group)
+		require.True(t, PrivateGroupScopeAllows(ctx, &id))
+		require.Equal(t, !tc.locked, PrivateGroupScopeAllows(ctx, &other))
+		require.Equal(t, !tc.locked, PrivateGroupScopeAllows(ctx, nil))
+	}
+}
+
+func TestResolveGatewayGroupRejectsNilPrivateScopeBeforeRepositoryLookup(t *testing.T) {
+	ctx := WithPrivateGroupScope(context.Background(), &Group{ID: 7, IsExclusive: true, SubscriptionType: "standard"})
+	// No repository is installed: the real method must reject before nil early-return.
+	s := &GatewayService{}
+	group, id, err := s.resolveGatewayGroup(ctx, nil)
+	require.ErrorIs(t, err, ErrPrivateGroupScope)
+	require.Nil(t, group)
+	require.Nil(t, id)
+	group, id, err = s.resolveGatewayGroup(context.Background(), nil)
+	require.NoError(t, err)
+	require.Nil(t, group)
+	require.Nil(t, id)
 }

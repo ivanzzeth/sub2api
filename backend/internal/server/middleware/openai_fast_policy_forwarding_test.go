@@ -77,7 +77,7 @@ func TestAPIKeyAuthForwardsUserScopedOpenAIFastPolicyToUpstream(t *testing.T) {
 		"key-user-42": newOpenAIFastPolicyForwardingAPIKey(1, "key-user-42", 42, groupID, group),
 		"key-user-43": newOpenAIFastPolicyForwardingAPIKey(2, "key-user-43", 43, groupID, group),
 	}
-	apiKeyService := service.NewAPIKeyService(&openAIFastPolicyForwardingAPIKeyRepo{apiKeys: apiKeys}, nil, nil, nil, nil, nil, cfg)
+	apiKeyService := service.NewAPIKeyService(&openAIFastPolicyForwardingAPIKeyRepo{apiKeys: apiKeys}, nil, &openAIFastPolicyForwardingGroupRepo{group: group}, nil, nil, nil, cfg)
 	account := &service.Account{
 		ID:          900,
 		Name:        "openai-upstream",
@@ -186,4 +186,17 @@ func (u *openAIFastPolicyForwardingHTTPUpstream) Do(req *http.Request, _ string,
 
 func (u *openAIFastPolicyForwardingHTTPUpstream) DoWithTLS(req *http.Request, proxyURL string, accountID int64, accountConcurrency int, _ *tlsfingerprint.Profile) (*http.Response, error) {
 	return u.Do(req, proxyURL, accountID, accountConcurrency)
+}
+
+// The forwarding fixture has one real public group. Unknown IDs remain missing.
+type openAIFastPolicyForwardingGroupRepo struct {
+	service.GroupRepository
+	group *service.Group
+}
+
+func (r *openAIFastPolicyForwardingGroupRepo) GetByID(_ context.Context, id int64) (*service.Group, error) {
+	if r.group == nil || r.group.ID != id {
+		return nil, service.ErrGroupNotFound
+	}
+	return r.group, nil
 }

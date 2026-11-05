@@ -1029,6 +1029,10 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 							_ = h.antigravityGatewayService.WriteMappedClaudeError(c, account, promptTooLongErr.StatusCode, promptTooLongErr.RequestID, promptTooLongErr.Body)
 							return
 						}
+						if !service.PrivateGroupScopeAllows(c.Request.Context(), &fallbackGroup.ID) {
+							h.errorResponse(c, http.StatusForbidden, "permission_error", "Private group fallback cannot change group")
+							return
+						}
 						fallbackAPIKey := cloneAPIKeyWithGroup(apiKey, fallbackGroup)
 						if err := h.billingCacheService.CheckBillingEligibility(c.Request.Context(), fallbackAPIKey.User, fallbackAPIKey, fallbackGroup, nil, service.PlatformFromAPIKey(fallbackAPIKey)); err != nil {
 							status, code, message, retryAfter := billingErrorDetails(err)
