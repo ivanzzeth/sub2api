@@ -920,7 +920,7 @@ func (s *GatewayService) routingAccountIDsForRequest(ctx context.Context, groupI
 }
 
 func (s *GatewayService) resolveGatewayGroup(ctx context.Context, groupID *int64) (*Group, *int64, error) {
-	if !PrivateGroupScopeAllows(ctx, groupID) {
+	if !PrivateGroupScopeAllows(ctx, groupID) || !geminiProxyGroupScopeAllows(ctx, groupID) {
 		return nil, nil, ErrPrivateGroupScope
 	}
 	if groupID == nil {
@@ -947,7 +947,7 @@ func (s *GatewayService) resolveGatewayGroup(ctx context.Context, groupID *int64
 		if group.FallbackGroupID == nil {
 			return nil, nil, ErrClaudeCodeOnly
 		}
-		if !PrivateGroupScopeAllows(ctx, group.FallbackGroupID) {
+		if !PrivateGroupScopeAllows(ctx, group.FallbackGroupID) || !geminiProxyGroupScopeAllows(ctx, group.FallbackGroupID) {
 			return nil, nil, ErrPrivateGroupScope
 		}
 		currentID = *group.FallbackGroupID

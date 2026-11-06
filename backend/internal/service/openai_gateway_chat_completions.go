@@ -130,6 +130,41 @@ func (s *OpenAIGatewayService) forwardAsChatCompletions(
 	if account.IsOpenCodeGo() && IsOpenCodeUnsupportedModel(routingModel) {
 		return nil, writeOpenCodeUnsupportedModelError(c, false, routingModel)
 	}
+	clientModel := gjson.GetBytes(body, "model").String()
+	if GeminiProxyModelAllowed(account, clientModel, "chatCompletions") {
+		media := chatConversionUnsupportedMedia(body)
+		if !geminiProxyChatTextOutputOnly(body) || media == "video_url" {
+			writeChatCompletionsError(c, http.StatusBadRequest, "unsupported_media_transport", "this bridge qualifies audio input to text output only")
+			return nil, errors.New("unqualified bridge audio output or video extension")
+		}
+		if media == "input_audio" {
+			if !geminiProxyChatAudioInputSupported(body) {
+				writeChatCompletionsError(c, http.StatusBadRequest, "invalid_request_error", "input_audio requires nonempty wav or mp3 data")
+				return nil, errors.New("invalid Chat input_audio")
+			}
+			key := getAPIKeyFromContext(c)
+			// Same native authority as 01: current full Account, original Group,
+			// exact model/native token price, never Source reference price alone.
+			authority := &GatewayService{accountRepo: s.accountRepo, resolver: s.resolver}
+			qualified, qualifyErr := authority.ValidateGeminiProxyAccountForKey(ctx, key, account, clientModel, clientModel, "chatCompletions")
+			if qualifyErr != nil || defaultMappedModel != "" && defaultMappedModel != clientModel && (qualified == nil || defaultMappedModel != qualified.GetMappedModel(clientModel)) {
+				writeChatCompletionsError(c, http.StatusForbidden, "permission_error", "raw Chat bridge model/Group/pin/price is not authorized")
+				return nil, errors.New("raw Chat bridge qualification failed")
+			}
+			executionCtx := withGeminiProxyChatExecutionScope(ctx, qualified, clientModel, *key.GroupID)
+			result, forwardErr := s.forwardAsRawChatCompletions(executionCtx, c, qualified, body, defaultMappedModel)
+			if forwardErr != nil {
+				if c.Request.Context().Err() != nil {
+					return result, c.Request.Context().Err()
+				}
+				if !c.Writer.Written() {
+					writeChatCompletionsError(c, http.StatusBadGateway, "upstream_outcome_unknown", "raw Chat execution failed; do not replay")
+				}
+				return result, errors.New("raw Chat bridge execution failed; replay is disabled")
+			}
+			return result, nil
+		}
+	}
 	switch s.resolveUpstreamProtocolFor(ctx, account, inbound, routingModel) {
 	case APIProtocolAnthropic:
 		if convertResponsesShape {
@@ -153,6 +188,10 @@ func (s *OpenAIGatewayService) forwardAsChatCompletions(
 
 	startTime := time.Now()
 
+	if media := chatConversionUnsupportedMedia(body); media != "" {
+		writeChatCompletionsError(c, http.StatusBadRequest, "unsupported_media_transport", "this Chat media cannot be represented by the selected Responses transport")
+		return nil, errors.New("Chat media cannot be represented by Responses")
+	}
 	// 1. Parse Chat Completions request
 	var chatReq apicompat.ChatCompletionsRequest
 	if err := json.Unmarshal(body, &chatReq); err != nil {

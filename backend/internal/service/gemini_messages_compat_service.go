@@ -1071,6 +1071,10 @@ func isGeminiSignatureRelatedError(respBody []byte) bool {
 }
 
 func (s *GeminiMessagesCompatService) ForwardNative(ctx context.Context, c *gin.Context, account *Account, originalModel string, action string, stream bool, body []byte) (*ForwardResult, error) {
+	proxyBridge := account != nil && account.Platform == PlatformOpenAI
+	if proxyBridge && !GeminiProxyModelAllowed(account, originalModel, action) {
+		return nil, s.writeGoogleError(c, http.StatusForbidden, "Gemini Proxy model/operation is not authorized")
+	}
 	beginUpstreamResponseModelObservation(c)
 	beginGeminiImageOutputObservation(c)
 	startTime := time.Now()
@@ -1086,7 +1090,7 @@ func (s *GeminiMessagesCompatService) ForwardNative(ctx context.Context, c *gin.
 	}
 
 	// 过滤掉 parts 为空的消息（Gemini API 不接受空 parts）
-	if filteredBody, err := filterEmptyPartsFromGeminiRequest(body); err == nil {
+	if filteredBody, err := filterEmptyPartsFromGeminiRequest(body); !proxyBridge && err == nil {
 		body = filteredBody
 	}
 
@@ -1099,7 +1103,9 @@ func (s *GeminiMessagesCompatService) ForwardNative(ctx context.Context, c *gin.
 
 	// Some Gemini upstreams validate tool call parts strictly; ensure any `functionCall` part includes a
 	// `thoughtSignature` to avoid frequent INVALID_ARGUMENT 400s.
-	body = ensureGeminiFunctionCallThoughtSignatures(body)
+	if !proxyBridge {
+		body = ensureGeminiFunctionCallThoughtSignatures(body)
+	}
 
 	mappedModel := originalModel
 	if account.Type == AccountTypeAPIKey || account.Type == AccountTypeServiceAccount {
@@ -1132,6 +1138,13 @@ func (s *GeminiMessagesCompatService) ForwardNative(ctx context.Context, c *gin.
 			}
 
 			baseURL := account.GetGeminiBaseURL(geminicli.AIStudioBaseURL)
+			if proxyBridge {
+				var err error
+				baseURL, err = geminiProxyBaseURL(account)
+				if err != nil {
+					return nil, "", err
+				}
+			}
 			normalizedBaseURL, err := s.validateUpstreamBaseURL(baseURL)
 			if err != nil {
 				return nil, "", err
@@ -1148,6 +1161,10 @@ func (s *GeminiMessagesCompatService) ForwardNative(ctx context.Context, c *gin.
 			}
 			upstreamReq.Header.Set("Content-Type", "application/json")
 			upstreamReq.Header.Set("x-goog-api-key", apiKey)
+			if proxyBridge {
+				account.ApplyHeaderOverrides(upstreamReq.Header)
+				upstreamReq.Header.Set("X-CLIProxy-Single-Attempt", "1")
+			}
 			return upstreamReq, "x-request-id", nil
 		}
 		requestIDHeader = "x-request-id"
@@ -1247,7 +1264,11 @@ func (s *GeminiMessagesCompatService) ForwardNative(ctx context.Context, c *gin.
 	var resp *http.Response
 	// checkedPolicy 是循环内对当前 resp 的错误策略检查结果，未检查时为 nil。
 	var checkedPolicy *ErrorPolicyResult
-	for attempt := 1; attempt <= geminiMaxRetries; attempt++ {
+	maxAttempts := geminiMaxRetries
+	if proxyBridge {
+		maxAttempts = 1
+	}
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		checkedPolicy = nil
 		upstreamReq, idHeader, err := buildReq(ctx)
 		if err != nil {
@@ -1265,7 +1286,27 @@ func (s *GeminiMessagesCompatService) ForwardNative(ctx context.Context, c *gin.
 		}
 		requestIDHeader = idHeader
 
+		if proxyBridge {
+			// Existing HTTP transport-only switch disables buffered write retries.
+			// It does not select the Voice protocol or change the Gemini payload.
+			upstreamReq = upstreamReq.WithContext(WithHTTPUpstreamVoiceSingleAttempt(WithHTTPUpstreamRedirectsDisabled(upstreamReq.Context())))
+		}
 		resp, err = s.httpUpstream.Do(upstreamReq, proxyURL, account.ID, account.Concurrency)
+		if proxyBridge && err != nil {
+			if isClientCanceledTransportError(ctx, err) {
+				return nil, err
+			}
+			return nil, s.writeGoogleError(c, http.StatusBadGateway, "Gemini Proxy execution outcome is unknown; do not replay")
+		}
+		if proxyBridge && resp.StatusCode >= 400 {
+			defer resp.Body.Close()
+			payload := s.readUpstreamErrorBody(resp)
+			requestID := resp.Header.Get("x-request-id")
+			if requestID == "" {
+				requestID = resp.Header.Get("x-goog-request-id")
+			}
+			return nil, s.writeGeminiNativeUpstreamError(c, account, resp, payload, requestID, false)
+		}
 		if err != nil {
 			transportErr := s.handleUpstreamTransportError(ctx, c, account, err)
 			// countTokens 不因上游链路故障而失败：本地估算兜底，不换号。

@@ -309,8 +309,12 @@ func (h *GatewayHandler) GeminiV1BetaModels(c *gin.Context) {
 
 	// 检查平台：优先使用强制平台（/antigravity 路由，中间件已设置 request.Context），否则要求 gemini 分组（composite 分组允许路由到 antigravity）
 	effectivePlatform := effectiveAPIKeyPlatform(c, apiKey)
+	proxyBridge := !middleware.HasForcePlatform(c) && apiKey.Group != nil && apiKey.GroupID != nil && apiKey.Group.ID == *apiKey.GroupID && effectivePlatform == service.PlatformOpenAI
+	if proxyBridge {
+		c.Request = c.Request.WithContext(service.WithGeminiProxyGroupScope(c.Request.Context(), *apiKey.GroupID))
+	}
 	if !middleware.HasForcePlatform(c) {
-		if effectivePlatform != service.PlatformGemini &&
+		if !proxyBridge && effectivePlatform != service.PlatformGemini &&
 			!servesCompositeAntigravityGemini(apiKey, effectivePlatform) {
 			googleError(c, http.StatusBadRequest, "API key group platform is not gemini")
 			return
@@ -336,6 +340,12 @@ func (h *GatewayHandler) GeminiV1BetaModels(c *gin.Context) {
 		return
 	}
 
+	// Models/countTokens/cache stay on their existing native platform paths.
+	// This bounded bridge grants generation operations only, never new models.
+	if proxyBridge && action != "generateContent" && action != "streamGenerateContent" {
+		googleError(c, http.StatusBadRequest, "Gemini Proxy operation is not qualified")
+		return
+	}
 	stream := action == "streamGenerateContent"
 	reqLog = reqLog.With(zap.String("model", modelName), zap.String("action", action), zap.Bool("stream", stream))
 
@@ -615,7 +625,7 @@ func (h *GatewayHandler) GeminiV1BetaModels(c *gin.Context) {
 
 		// 检测账号切换：如果粘性会话绑定的账号与当前选择的账号不同，清除 thoughtSignature
 		// 注意：Gemini 原生 API 的 thoughtSignature 与具体上游账号强相关；跨账号透传会导致 400。
-		if sessionBoundAccountID > 0 && sessionBoundAccountID != account.ID {
+		if !proxyBridge && sessionBoundAccountID > 0 && sessionBoundAccountID != account.ID {
 			reqLog.Info("gemini.sticky_session_account_switched",
 				zap.Int64("from_account_id", sessionBoundAccountID),
 				zap.Int64("to_account_id", account.ID),
@@ -623,7 +633,7 @@ func (h *GatewayHandler) GeminiV1BetaModels(c *gin.Context) {
 			)
 			body = service.CleanGeminiNativeThoughtSignatures(body)
 			sessionBoundAccountID = account.ID
-		} else if sessionKey != "" && sessionBoundAccountID == 0 && !cleanedForUnknownBinding && bytes.Contains(body, []byte(`"thoughtSignature"`)) {
+		} else if !proxyBridge && sessionKey != "" && sessionBoundAccountID == 0 && !cleanedForUnknownBinding && bytes.Contains(body, []byte(`"thoughtSignature"`)) {
 			// 无缓存绑定但请求里已有 thoughtSignature：常见于缓存丢失/TTL 过期后，客户端继续携带旧签名。
 			// 为避免第一次转发就 400，这里做一次确定性清理，让新账号重新生成签名链路。
 			reqLog.Info("gemini.sticky_session_binding_missing",
@@ -707,6 +717,17 @@ func (h *GatewayHandler) GeminiV1BetaModels(c *gin.Context) {
 		}
 		account = latest
 		selection.Account = latest
+		if proxyBridge {
+			qualified, err := h.gatewayService.ValidateGeminiProxyAccountForKey(admissionCtx, apiKey, account, reqModel, modelName, action)
+			if err != nil {
+				if accountReleaseFunc != nil {
+					accountReleaseFunc()
+				}
+				googleError(c, http.StatusForbidden, "Gemini Proxy model/operation is not authorized")
+				return
+			}
+			account, selection.Account = qualified, qualified
+		}
 		// 等待路径保持既有 eager 绑定（无门时 helper 直接绑定）；调度器已抢槽
 		// 的直达路径无门时由选号内部绑定，这里只在门下补准入后绑定。
 		if selection.ProfitGateActive() || !selection.Acquired {
@@ -737,12 +758,19 @@ func (h *GatewayHandler) GeminiV1BetaModels(c *gin.Context) {
 				service.WithForwardGeminiSession(sessionGroupID, sessionKey),
 			)
 		} else {
+			if proxyBridge {
+				service.SetActualOpenAIUpstreamEndpoint(c, EndpointGeminiModels)
+			}
 			result, err = h.geminiCompatService.ForwardNative(requestCtx, c, account, modelName, action, stream, body)
 		}
 		if accountReleaseFunc != nil {
 			accountReleaseFunc()
 		}
 		if err != nil {
+			if proxyBridge {
+				failoverClientGone(c)
+				return // A possible execution is never replayed onto another Account.
+			}
 			var failoverErr *service.UpstreamFailoverError
 			if errors.As(err, &failoverErr) {
 				failoverAction := fs.HandleFailoverError(c.Request.Context(), h.gatewayService, account.ID, account.Platform, account.GetPoolModeRetryCount(), failoverErr)

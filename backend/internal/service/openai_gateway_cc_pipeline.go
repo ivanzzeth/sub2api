@@ -16,6 +16,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/Wei-Shaw/sub2api/internal/util/responseheaders"
 	"github.com/gin-gonic/gin"
+	"github.com/tidwall/gjson"
 	"go.uber.org/zap"
 )
 
@@ -245,6 +246,14 @@ func (s *OpenAIGatewayService) sendCCUpstreamRequest(
 	// 账号级请求头覆写：放在所有内置默认头（含 Grok CLI 身份头）之后应用，
 	// 使配置值获得除共享传输层强制头之外的最高优先级。
 	account.ApplyHeaderOverrides(upstreamReq.Header)
+	singleAttempt, scopeErr := geminiProxyChatExecutionPolicy(ctx, account, gjson.GetBytes(body, "model").String())
+	if scopeErr != nil {
+		return nil, scopeErr
+	}
+	if singleAttempt {
+		upstreamReq.Header.Set("X-CLIProxy-Single-Attempt", "1")
+		upstreamReq = upstreamReq.WithContext(WithHTTPUpstreamVoiceSingleAttempt(WithHTTPUpstreamRedirectsDisabled(upstreamReq.Context())))
+	}
 	applyOpenCodeSessionHeader(c, account, targetURL, upstreamReq.Header, body)
 
 	proxyURL := ""
